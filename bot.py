@@ -142,6 +142,13 @@ class TeamBot:
     def _is_admin(self, matrix_id: str) -> bool:
         return matrix_id in self.config.admin_users
 
+    async def _resolve_player(self, query: str) -> Optional[Dict]:
+        """
+        Spieler per Matrix-ID (@user:server) oder Anzeigenamen finden.
+        Gibt None zurück wenn nicht gefunden.
+        """
+        return await self.db.find_player(query)
+
     def _has_teams(self) -> bool:
         return bool(self._t1_field or self._t1_gk or self._t2_field or self._t2_gk)
 
@@ -293,11 +300,12 @@ class TeamBot:
             return await self.send("❌ Keine Berechtigung.")
 
         if sub == "add":
-            # !player add @id Name [gk]
+            # add benötigt immer Matrix-ID (neuer Spieler, Name noch nicht in DB)
             if len(args) < 3:
                 return await self.send(
                     "Syntax: `!player add @user:server Name [gk]`\n"
-                    "`gk` am Ende = Spieler kann Torwart spielen."
+                    "`gk` am Ende = Spieler kann Torwart spielen.\n"
+                    "Hinweis: `add` benötigt immer die Matrix-ID."
                 )
             matrix_id = args[1]
             name      = args[2]
@@ -310,18 +318,19 @@ class TeamBot:
             await self.send(f"✅ **{name}** hinzugefügt{hint}.")
 
         elif sub == "set":
-            # !player set @id 7.5            → field (Standard)
-            # !player set @id field 7.5      → field
-            # !player set @id gk 8.0         → gk
+            # !player set @id|Name 7.5           → field (Standard)
+            # !player set @id|Name field 7.5     → field
+            # !player set @id|Name gk 8.0        → gk
             if len(args) < 3:
                 return await self.send(
-                    "Syntax: `!player set @user:server [field|gk] Wert`\n"
+                    "Syntax: `!player set @user:server|Name [field|gk] Wert`\n"
                     "Ohne Typ-Angabe wird immer `field` gesetzt."
                 )
-            matrix_id = args[1]
             if args[2].lower() in ("field", "gk"):
                 if len(args) < 4:
-                    return await self.send("Syntax: `!player set @user:server [field|gk] Wert`")
+                    return await self.send(
+                        "Syntax: `!player set @user:server|Name [field|gk] Wert`"
+                    )
                 score_type = args[2].lower()
                 score_str  = args[3]
             else:
@@ -333,26 +342,26 @@ class TeamBot:
             except ValueError:
                 return await self.send("❌ Score muss eine Zahl zwischen 0 und 10 sein.")
 
-            p = await self.db.get_player(matrix_id)
+            p = await self._resolve_player(args[1])
             if not p:
-                return await self.send(f"❌ `{matrix_id}` nicht gefunden.")
+                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.")
 
             if score_type == "field":
-                await self.db.update_field_score(matrix_id, score)
+                await self.db.update_field_score(p["matrix_id"], score)
                 await self.send(f"✅ **{p['display_name']}** – Feld: **{score:.2f}**")
             else:
-                await self.db.update_gk_score(matrix_id, score)
+                await self.db.update_gk_score(p["matrix_id"], score)
                 await self.send(f"✅ **{p['display_name']}** – Torwart: **{score:.2f}**")
 
         elif sub == "gk":
-            # !player gk @id  →  togglet can_gk
+            # !player gk @id oder Name  →  togglet can_gk
             if len(args) < 2:
-                return await self.send("Syntax: `!player gk @user:server`")
-            p = await self.db.get_player(args[1])
+                return await self.send("Syntax: `!player gk @user:server` oder `!player gk Name`")
+            p = await self._resolve_player(args[1])
             if not p:
-                return await self.send(f"❌ `{args[1]}` nicht gefunden.")
+                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.")
             new_val = not bool(p.get("can_gk"))
-            await self.db.set_can_gk(args[1], new_val)
+            await self.db.set_can_gk(p["matrix_id"], new_val)
             status = "🧤 aktiviert" if new_val else "⚽ deaktiviert"
             await self.send(
                 f"✅ **{p['display_name']}** – GK-Fähigkeit: **{status}**\n"
@@ -361,11 +370,11 @@ class TeamBot:
 
         elif sub == "del":
             if len(args) < 2:
-                return await self.send("Syntax: `!player del @user:server`")
-            p = await self.db.get_player(args[1])
+                return await self.send("Syntax: `!player del @user:server` oder `!player del Name`")
+            p = await self._resolve_player(args[1])
             if not p:
-                return await self.send(f"❌ `{args[1]}` nicht gefunden.")
-            await self.db.deactivate_player(args[1])
+                return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.")
+            await self.db.deactivate_player(p["matrix_id"])
             await self.send(f"✅ **{p['display_name']}** deaktiviert.")
 
         else:
@@ -380,14 +389,15 @@ class TeamBot:
             return await self.send("Noch keine Spieler in der Datenbank.")
 
         lines = ["**👥 Spieler & Scores**", ""]
-        lines.append(f"{'Name':<18} {'Feld':>6}  {'GK':>6}  ")
-        lines.append("─" * 38)
+        lines.append(f"{'Name':<18} {'Feld':>6}  {'GK':>6}  {'Matrix-ID'}")
+        lines.append("─" * 60)
         for p in players:
             gk_tag = " 🧤" if p.get("can_gk") else ""
             lines.append(
                 f"{p['display_name']:<18} "
                 f"{p.get('score_field', 5.0):>6.2f}  "
-                f"{p.get('score_gk', 5.0):>6.2f}{gk_tag}"
+                f"{p.get('score_gk', 5.0):>6.2f}{gk_tag:<3}  "
+                f"`{p['matrix_id']}`"
             )
         await self.send("\n".join(lines))
 

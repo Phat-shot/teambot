@@ -140,6 +140,29 @@ class Database:
             row = await cur.fetchone()
             return dict(row) if row else None
 
+    async def find_player(self, query: str) -> Optional[Dict]:
+        """
+        Flexible Spieler-Suche: akzeptiert Matrix-ID (@user:server)
+        oder Anzeigename (case-insensitive, Teilstring reicht nicht –
+        exakter Match bevorzugt, sonst None).
+        """
+        # Erst exakt per Matrix-ID
+        if query.startswith("@"):
+            async with self._db.execute(
+                "SELECT * FROM players WHERE matrix_id = ? AND active = 1",
+                (query,)
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    return dict(row)
+        # Dann exakt per Anzeigename (case-insensitive)
+        async with self._db.execute(
+            "SELECT * FROM players WHERE lower(display_name) = lower(?) AND active = 1",
+            (query,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
     async def get_player_by_id(self, player_id: int) -> Optional[Dict]:
         async with self._db.execute(
             "SELECT * FROM players WHERE id = ?", (player_id,)
