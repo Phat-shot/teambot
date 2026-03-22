@@ -42,7 +42,7 @@ from nio import (
 
 from config import Config
 from db import Database
-from teams import build_teams, format_teams
+from teams import build_teams, format_teams, effective_score
 
 logger = logging.getLogger(__name__)
 
@@ -51,36 +51,40 @@ HELP_TEXT = """\
 **⚽ TeamBot – Befehle**
 
 **Für alle**
-`!player`            – Spielerliste mit Feld- und GK-Score
-`!match [N]`         – Letzte 5 (oder N) Ergebnisse
-`!gk`                – Als Torwart für dieses Spiel melden
-`!kein_gk`           – GK-Meldung zurückziehen
-`!team`              – Teams aus dem aktuellen Vote generieren
-`!help`              – Diese Hilfe
+`!player`        – Spielerliste mit Scores und Matrix-ID
+`!match [N]`     – Letzte 5 (oder N) Ergebnisse
+`!gk`            – Als Torwart für dieses Spiel melden
+`!kein_gk`       – GK-Meldung zurückziehen
+`!team`          – Teams aus dem aktuellen Vote generieren
+`!help`          – Diese Hilfe
 
-**Admin – Spieler-Stammdaten**
+**Admin – Spieler-Stammdaten** _(Name oder @user:server möglich)_
 `!player add @user:server Name`      – Spieler anlegen
 `!player add @user:server Name gk`   – Spieler anlegen (Torwart-fähig)
-`!player set @user:server 7.5`       – Feldspieler-Score setzen (Standard)
-`!player set @user:server field 7.5` – Feldspieler-Score setzen (explizit)
-`!player set @user:server gk 8.0`    – Torwart-Score setzen
-`!player gk @user:server`            – GK-Fähigkeit ein/aus (Score bleibt erhalten)
-`!player del @user:server`           – Spieler deaktivieren
+`!player set Name 7.5`               – Feldspieler-Score setzen
+`!player set Name field 7.5`         – Feldspieler-Score setzen (explizit)
+`!player set Name gk 8.0`            – Torwart-Score setzen
+`!player gk Name`                    – GK-Fähigkeit ein/aus (Score bleibt)
+`!player del Name`                   – Spieler deaktivieren
 
-**Admin – Aktuelles Spiel**
-`!match change Name1 Name2`  – Zwei Spieler zwischen den Teams tauschen
+**Admin – Aktuelles Spiel** _(Name oder @user:server möglich)_
+`!match change Name1 Name2`  – Zwei Spieler tauschen
 `!match change Name`         – Spieler ins andere Team verschieben
 `!match gk Name`             – Spieler als Torwart seines Teams setzen
-`!match switched Name`       – Score-Wertung für Spieler ein-/ausschalten
+`!match switched Name`       – Score-Wertung ein-/ausschalten (Toggle)
 
 **Admin – Ergebnis & Vote**
-`!result 3:2`  – Ergebnis eintragen und Scores neu berechnen
-`!vote`        – Wöchentlichen Vote sofort starten
+`!result 3:2`  – Ergebnis + Score-Update
+`!vote`        – Vote sofort starten
 
-**Torwart-Zuweisung (automatisch bei !team)**
-① Freiwillige (`!gk`) sortiert nach GK-Score
-② Spieler mit GK-Fähigkeit sortiert nach GK-Score
-③ Fallback: schwächster Feldspieler pro Team
+**Score-System**
+Feldspieler: `field`-Score · GK-fähige Spieler: `0,5 × field + 0,5 × gk`
+Neuberechnung: 50 % Basis · 30 % letzte 5 Spiele · 20 % letztes Spiel
+
+**Torwart-Zuweisung**
+① Freiwillige (`!gk`) nach GK-Score
+② GK-fähige Spieler nach GK-Score
+③ Fallback: schwächster Spieler pro Team
 """
 
 
@@ -799,13 +803,13 @@ class TeamBot:
             self._t2_gk = player
 
     def _auto_gk_fallback(self, team: str):
-        """Setze schwächsten Feldspieler des Teams automatisch als GK."""
+        """Setze schwächsten Spieler (effective_score) des Teams automatisch als GK."""
         field_attr = f"_{team}_field"
         gk_attr    = f"_{team}_gk"
         field      = getattr(self, field_attr)
         if not field:
             return
-        fallback = min(field, key=lambda p: p.get("score_field", 5.0))
+        fallback = min(field, key=effective_score)
         setattr(self, field_attr, [p for p in field if p["id"] != fallback["id"]])
         setattr(self, gk_attr, fallback)
 

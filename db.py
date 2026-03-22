@@ -13,7 +13,6 @@ Tables:
 import json
 import logging
 import os
-from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import aiosqlite
@@ -333,65 +332,83 @@ class Database:
         player_ids: List[int],
         gk_ids: Optional[List[int]] = None,
     ):
-        cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+        """
+        Score-Neuberechnung:
+          50 % Basis      (all-time Durchschnitt aller Spiele)
+          30 % Letzte 5   (Durchschnitt der letzten 5 Spiele)
+          20 % Letztes    (letztes Spiel)
+
+        field-Score: nur Spiele als Feldspieler
+        gk-Score:    nur Spiele als Torwart (nur für gk_ids)
+        """
         gk_set = set(gk_ids or [])
 
         for pid in player_ids:
-            # Field score (only from matches played as field player)
-            avg_all = await self._scalar(
+            # ── Field score ──────────────────────────────────────────────
+            base_field = await self._scalar(
                 "SELECT AVG(match_score) FROM match_participations WHERE player_id=? AND played_gk=0",
                 (pid,), default=None,
             )
-            if avg_all is not None:
-                avg_3m = await self._scalar(
-                    """SELECT AVG(mp.match_score) FROM match_participations mp
-                       JOIN matches m ON mp.match_id=m.id
-                       WHERE mp.player_id=? AND mp.played_gk=0 AND m.played_at>=?""",
-                    (pid, cutoff), default=avg_all,
+            if base_field is not None:
+                last5_field = await self._scalar(
+                    """SELECT AVG(match_score) FROM (
+                         SELECT mp.match_score FROM match_participations mp
+                         JOIN matches m ON mp.match_id = m.id
+                         WHERE mp.player_id=? AND mp.played_gk=0
+                         ORDER BY m.played_at DESC LIMIT 5
+                       )""",
+                    (pid,), default=base_field,
                 )
-                last = await self._scalar(
+                last1_field = await self._scalar(
                     """SELECT mp.match_score FROM match_participations mp
-                       JOIN matches m ON mp.match_id=m.id
+                       JOIN matches m ON mp.match_id = m.id
                        WHERE mp.player_id=? AND mp.played_gk=0
                        ORDER BY m.played_at DESC LIMIT 1""",
-                    (pid,), default=avg_all,
+                    (pid,), default=base_field,
                 )
                 new_field = round(
-                    min(10.0, max(0.0, avg_all * 0.50 + avg_3m * 0.30 + last * 0.20)), 2
+                    min(10.0, max(0.0,
+                        base_field * 0.50 + last5_field * 0.30 + last1_field * 0.20
+                    )), 2
                 )
                 await self._db.execute(
                     "UPDATE players SET score_field=? WHERE id=?", (new_field, pid)
                 )
 
-            # GK score (only for players who played GK this match)
+            # ── GK score (nur für Spieler die diesmal als GK gespielt haben) ──
             if pid in gk_set:
-                avg_gk = await self._scalar(
+                base_gk = await self._scalar(
                     "SELECT AVG(match_score) FROM match_participations WHERE player_id=? AND played_gk=1",
                     (pid,), default=None,
                 )
-                if avg_gk is not None:
-                    avg_3m_gk = await self._scalar(
-                        """SELECT AVG(mp.match_score) FROM match_participations mp
-                           JOIN matches m ON mp.match_id=m.id
-                           WHERE mp.player_id=? AND mp.played_gk=1 AND m.played_at>=?""",
-                        (pid, cutoff), default=avg_gk,
+                if base_gk is not None:
+                    last5_gk = await self._scalar(
+                        """SELECT AVG(match_score) FROM (
+                             SELECT mp.match_score FROM match_participations mp
+                             JOIN matches m ON mp.match_id = m.id
+                             WHERE mp.player_id=? AND mp.played_gk=1
+                             ORDER BY m.played_at DESC LIMIT 5
+                           )""",
+                        (pid,), default=base_gk,
                     )
-                    last_gk = await self._scalar(
+                    last1_gk = await self._scalar(
                         """SELECT mp.match_score FROM match_participations mp
-                           JOIN matches m ON mp.match_id=m.id
+                           JOIN matches m ON mp.match_id = m.id
                            WHERE mp.player_id=? AND mp.played_gk=1
                            ORDER BY m.played_at DESC LIMIT 1""",
-                        (pid,), default=avg_gk,
+                        (pid,), default=base_gk,
                     )
                     new_gk = round(
-                        min(10.0, max(0.0, avg_gk * 0.50 + avg_3m_gk * 0.30 + last_gk * 0.20)), 2
+                        min(10.0, max(0.0,
+                            base_gk * 0.50 + last5_gk * 0.30 + last1_gk * 0.20
+                        )), 2
                     )
                     await self._db.execute(
                         "UPDATE players SET score_gk=? WHERE id=?", (new_gk, pid)
                     )
 
         await self._db.commit()
-        logger.info("Scores recalculated for %d players", len(player_ids))
+        logger.info("Scores neu berechnet für %d Spieler", len(player_ids))
 
     async def get_last_match(self) -> Optional[Dict]:
         async with self._db.execute(

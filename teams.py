@@ -6,12 +6,33 @@ GK-Zuweisung (Priorität):
   2. can_gk=True Spieler mit bestem score_gk (einer pro Team)
   3. Spieler mit niedrigstem score_field pro Team (Fallback)
 
-Balancing der Feldspieler nach score_field (exakt kombinatorisch).
+Effektiver Score für Balancing:
+  can_gk=True  →  0.5 × field + 0.5 × gk
+  can_gk=False →  field
+
+Balancing der Feldspieler nach effective_score (exakt kombinatorisch).
 """
 
 import random
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
+
+
+# ------------------------------------------------------------------
+# Score helpers
+# ------------------------------------------------------------------
+
+def effective_score(player: Dict) -> float:
+    """
+    Balancing-Score eines Spielers.
+    GK-fähige Spieler: 50 % field + 50 % gk.
+    Alle anderen: reiner field-Score.
+    """
+    field = float(player.get("score_field", 5.0))
+    if player.get("can_gk"):
+        gk = float(player.get("score_gk", 5.0))
+        return round((field + gk) / 2, 2)
+    return round(field, 2)
 
 
 # ------------------------------------------------------------------
@@ -30,7 +51,7 @@ def assign_gks(
     if n < 2:
         return None, None, players
 
-    by_id = {p["matrix_id"]: p for p in players}
+    by_id = {p["matrix_id"]: p for p in players if "matrix_id" in p}
 
     # ① Freiwillige die auch im Vote sind
     vols = [by_id[m] for m in gk_volunteers if m in by_id]
@@ -50,7 +71,7 @@ def assign_gks(
         gk1, gk2 = gk_pool[0], gk_pool[1]
     elif len(gk_pool) == 1:
         gk1 = gk_pool[0]
-        gk2 = None   # assigned later from field fallback
+        gk2 = None
     else:
         gk1 = gk2 = None
 
@@ -58,13 +79,13 @@ def assign_gks(
     assigned = {p["id"] for p in [gk1, gk2] if p}
     field = [p for p in players if p["id"] not in assigned]
 
-    # ③ Fallback: if still need GKs, take worst field scorer
+    # ③ Fallback: schwächster effective_score pro Team
     if gk1 is None and field:
-        fallback = min(field, key=lambda p: p.get("score_field", 5.0))
+        fallback = min(field, key=effective_score)
         gk1 = fallback
         field = [p for p in field if p["id"] != fallback["id"]]
     if gk2 is None and field:
-        fallback = min(field, key=lambda p: p.get("score_field", 5.0))
+        fallback = min(field, key=effective_score)
         gk2 = fallback
         field = [p for p in field if p["id"] != fallback["id"]]
 
@@ -75,10 +96,8 @@ def assign_gks(
 # Field player balancing
 # ------------------------------------------------------------------
 
-def balance_field_players(
-    players: List[Dict],
-) -> Tuple[List[Dict], List[Dict]]:
-    """Split field players into two balanced halves by score_field."""
+def balance_field_players(players: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Split field players into two balanced halves by effective_score."""
     n = len(players)
     if n == 0:
         return [], []
@@ -86,15 +105,12 @@ def balance_field_players(
         return players, []
 
     half = n // 2
-
     best_diff = float("inf")
     best_t2: frozenset = frozenset()
 
     for combo in combinations(range(n), half):
-        t2_score = sum(players[i].get("score_field", 5.0) for i in combo)
-        t1_score = sum(
-            players[i].get("score_field", 5.0) for i in range(n) if i not in combo
-        )
+        t2_score = sum(effective_score(players[i]) for i in combo)
+        t1_score = sum(effective_score(players[i]) for i in range(n) if i not in combo)
         diff = abs(t1_score - t2_score)
         if diff < best_diff:
             best_diff = diff
@@ -144,10 +160,14 @@ def format_teams(
         return f"  🧤 {gk['display_name']} (GK {score:.2f}){tag}"
 
     def field_line(p: Dict) -> str:
-        return f"  ⚽ {p['display_name']} ({p.get('score_field', 5.0):.2f})"
+        score = effective_score(p)
+        label = f"{p.get('score_field', 5.0):.2f}"
+        if p.get("can_gk"):
+            label += f"/gk{p.get('score_gk', 5.0):.2f}"
+        return f"  ⚽ {p['display_name']} ({label})"
 
-    t1_total = sum(p.get("score_field", 5.0) for p in t1_field)
-    t2_total = sum(p.get("score_field", 5.0) for p in t2_field)
+    t1_total = sum(effective_score(p) for p in t1_field)
+    t2_total = sum(effective_score(p) for p in t2_field)
 
     if gk1:
         t1_total += gk1.get("score_gk", 5.0)
