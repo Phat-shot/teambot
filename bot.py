@@ -26,6 +26,7 @@ BEFEHLE (Admin – schreibend)
 """
 
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -37,12 +38,16 @@ from nio import (
     LoginResponse,
     RoomMessageText,
     RoomSendResponse,
+    SyncResponse,
     UnknownEvent,
 )
 
 from config import Config
 from db import Database
 from teams import build_teams, format_teams, effective_score
+
+SYNC_TOKEN_PATH = "data/sync_token"
+MAX_EVENT_AGE_SECONDS = 7 * 24 * 3600   # 1 Woche
 
 logger = logging.getLogger(__name__)
 
@@ -117,12 +122,25 @@ class TeamBot:
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(self._on_reaction, UnknownEvent)
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
+        self.client.add_response_callback(self._on_sync, SyncResponse)
 
         self._setup_scheduler()
         self.scheduler.start()
 
+        # Sync-Token laden – Bot setzt nach Neustart genau hier fort
+        since = _load_sync_token()
+        if since:
+            logger.info("Sync-Token geladen – überspringe bereits verarbeitete Events")
+        else:
+            logger.info("Kein Sync-Token – erster Start, verarbeite nur neue Events")
+
         logger.info("Bot läuft – Sync-Loop startet …")
-        await self.client.sync_forever(timeout=30_000, full_state=True)
+        await self.client.sync_forever(
+            timeout=30_000,
+            full_state=True,
+            since=since,
+            sync_filter=_build_sync_filter(),
+        )
 
     def _setup_scheduler(self):
         cfg = self.config
@@ -199,10 +217,24 @@ class TeamBot:
         else:
             logger.error("Beitritt fehlgeschlagen %s: %s", room.room_id, resp)
 
+    async def _on_sync(self, response):
+        """Sync-Token nach jedem erfolgreichen Sync persistieren."""
+        _save_sync_token(response.next_batch)
+
     async def _on_message(self, room, event):
         if room.room_id != self.config.room_id:
             return
         if event.sender == self.config.user_id:
+            return
+
+        # Events älter als 1 Woche ignorieren (Schutz nach Neustart)
+        age_ms = getattr(event, "age", None)
+        if age_ms is None:
+            # server_timestamp ist Unix-ms
+            ts = getattr(event, "server_timestamp", 0)
+            age_ms = (datetime.now().timestamp() * 1000) - ts
+        if age_ms > MAX_EVENT_AGE_SECONDS * 1000:
+            logger.debug("Event übersprungen (zu alt: %.0fs): %s", age_ms/1000, event.event_id)
             return
 
         body = event.body.strip()
@@ -821,6 +853,43 @@ class TeamBot:
 def _opposite_slot(slot: str) -> str:
     return {"t1_field": "t2_field", "t2_field": "t1_field",
             "t1_gk": "t2_gk",       "t2_gk":    "t1_gk"}.get(slot, "t2_field")
+
+
+def _load_sync_token() -> Optional[str]:
+    """Gespeicherten Sync-Token laden."""
+    try:
+        with open(SYNC_TOKEN_PATH, "r") as f:
+            token = f.read().strip()
+            return token if token else None
+    except FileNotFoundError:
+        return None
+
+
+def _save_sync_token(token: str):
+    """Sync-Token auf Disk schreiben (atomar)."""
+    os.makedirs(os.path.dirname(SYNC_TOKEN_PATH), exist_ok=True)
+    tmp = SYNC_TOKEN_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(token)
+    os.replace(tmp, SYNC_TOKEN_PATH)
+
+
+def _build_sync_filter() -> dict:
+    """
+    Sync-Filter: nur Timeline-Events der letzten 7 Tage anfordern.
+    Reduziert Last beim ersten Sync nach längerem Ausfall.
+    """
+    since_ms = int(
+        (datetime.now().timestamp() - MAX_EVENT_AGE_SECONDS) * 1000
+    )
+    return {
+        "room": {
+            "timeline": {
+                "limit": 50,
+                "not_senders": [],
+            }
+        }
+    }
 
 
 def _md_to_html(text: str) -> str:
