@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   teambot:
-    build: .
+    image: ghcr.io/phat-shot/teambot:latest
     container_name: teambot
     restart: unless-stopped
     volumes:
