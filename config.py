@@ -10,6 +10,10 @@ class Config:
     room_id: str
     admin_room_id: str = ""
 
+    # Optionaler zweiter Account für Poll-Versand (WA-Bridge-Workaround)
+    poll_sender_id: str = ""
+    poll_sender_password: str = ""
+
     db_path: str = "data/teambot.db"
 
     vote_weekday: int = 5

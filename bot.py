@@ -107,6 +107,7 @@ class TeamBot:
         self.config = config
         self.db = Database(config.db_path)
         self.client = AsyncClient(config.homeserver, config.user_id)
+        self.poll_client: Optional[AsyncClient] = None
         self.scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
 
         # Aktuell aktive Teams (für Korrekturen und !result)
@@ -140,6 +141,17 @@ class TeamBot:
         if not isinstance(resp, LoginResponse):
             raise RuntimeError(f"Matrix-Login fehlgeschlagen: {resp}")
         logger.info("Eingeloggt als %s", self.config.user_id)
+
+        # Zweiter Client für Poll-Versand – kein sync_forever, nur senden
+        if self.config.poll_sender_id and self.config.poll_sender_password:
+            self.poll_client = AsyncClient(self.config.homeserver, self.config.poll_sender_id)
+            pr = await self.poll_client.login(self.config.poll_sender_password)
+            if isinstance(pr, LoginResponse):
+                logger.info("Poll-Sender eingeloggt als %s", self.config.poll_sender_id)
+            else:
+                logger.warning("Poll-Sender Login fehlgeschlagen (%s) – Polls werden als Bot gesendet", pr)
+                await self.poll_client.close()
+                self.poll_client = None
 
 
         self.client.add_event_callback(self._on_message, RoomMessageText)
@@ -267,6 +279,8 @@ class TeamBot:
     async def _on_message(self, room, event):
         if event.sender == self.config.user_id:
             return
+        if self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
+            return
 
         # Events älter als 1 Woche ignorieren (Schutz nach Neustart)
         age_ms = getattr(event, "age", None)
@@ -331,6 +345,8 @@ class TeamBot:
 
     async def _on_reaction(self, room, event):
         if event.sender == self.config.user_id:
+            return
+        if self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
             return
 
         content = event.source.get("content", {})
@@ -1190,9 +1206,11 @@ class TeamBot:
             logger.warning("Redact fehlgeschlagen %s: %s", event_id, exc)
 
     async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
-        """Poll posten und event_id zurückgeben."""
-        resp = await self.client.room_send(room_id, POLL_EVENT_TYPE, content)
+        """Poll posten – über poll_client falls konfiguriert, sonst Bot."""
+        client = self.poll_client if self.poll_client else self.client
+        resp = await client.room_send(room_id, POLL_EVENT_TYPE, content)
         if isinstance(resp, RoomSendResponse):
+            logger.info("Poll gesendet als %s", client.user_id)
             return resp.event_id
         logger.error("Poll fehlgeschlagen: %s", resp)
         return None
