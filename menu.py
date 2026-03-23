@@ -12,6 +12,7 @@ Polls werden nach Auswahl redacted (gelöscht).
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from poll import make_poll
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Menü-Struktur
@@ -121,59 +122,18 @@ class MenuManager:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def category_poll_content() -> dict:
-    answers_msc = [
-        {"id": f"cat_{i}", "org.matrix.msc3381.poll.answer.text": cat}
-        for i, cat in enumerate(CATEGORIES)
-    ]
-    answers_stable = [
-        {"id": f"cat_{i}", "m.text": cat}
-        for i, cat in enumerate(CATEGORIES)
-    ]
-    return {
-        "msgtype": "m.text",
-        "body": "🤖 TeamBot – Was möchtest du tun?",
-        "org.matrix.msc3381.poll.start": {
-            "kind": "org.matrix.msc3381.poll.disclosed",
-            "max_selections": 1,
-            "question": {"body": "🤖 TeamBot – Was möchtest du tun?"},
-            "answers": answers_msc,
-        },
-        "m.poll.start": {
-            "kind": "m.poll.disclosed",
-            "max_selections": 1,
-            "question": {"body": "🤖 TeamBot – Was möchtest du tun?"},
-            "answers": answers_stable,
-        },
-    }
+    return make_poll(
+        "🤖 TeamBot – Was möchtest du tun?",
+        [(f"cat_{i}", cat) for i, cat in enumerate(CATEGORIES)],
+    )
 
 
 def command_poll_content(category: str) -> dict:
     items = MENU[category]
-    answers_msc = [
-        {"id": f"cmd_{i}", "org.matrix.msc3381.poll.answer.text": item.label}
-        for i, item in enumerate(items)
-    ]
-    answers_stable = [
-        {"id": f"cmd_{i}", "m.text": item.label}
-        for i, item in enumerate(items)
-    ]
-    title = f"{category} – Was genau?"
-    return {
-        "msgtype": "m.text",
-        "body": title,
-        "org.matrix.msc3381.poll.start": {
-            "kind": "org.matrix.msc3381.poll.disclosed",
-            "max_selections": 1,
-            "question": {"body": title},
-            "answers": answers_msc,
-        },
-        "m.poll.start": {
-            "kind": "m.poll.disclosed",
-            "max_selections": 1,
-            "question": {"body": title},
-            "answers": answers_stable,
-        },
-    }
+    return make_poll(
+        f"{category} – Was genau?",
+        [(f"cmd_{i}", item.label) for i, item in enumerate(items)],
+    )
 
 
 def parse_category_answer(answer_id: str) -> Optional[str]:

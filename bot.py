@@ -45,6 +45,7 @@ from nio import (
 from config import Config
 from db import Database
 from menu import MenuManager, category_poll_content, command_poll_content, parse_category_answer, parse_command_answer
+from poll import make_poll, POLL_EVENT_TYPE, POLL_RESPONSE_TYPES, POLL_RESPONSE_KEYS
 from teams import build_teams, format_teams, effective_score, TEAM1_NAME, TEAM2_NAME
 
 TEAM1_LABEL = TEAM1_NAME
@@ -334,13 +335,13 @@ class TeamBot:
 
         content = event.source.get("content", {})
 
-        # Native Matrix-Poll-Antwort (MSC3381)
-        if event.type in ("org.matrix.msc3381.poll.response", "m.poll.response"):
+        # Native Matrix-Poll-Antwort
+        if event.type in POLL_RESPONSE_TYPES:
             relates_to    = content.get("m.relates_to", {})
             poll_event_id = relates_to.get("event_id")
-            answers = (
-                content.get("org.matrix.msc3381.poll.response", {})
-                or content.get("m.poll.response", {})
+            answers = next(
+                (content.get(k, {}) for k in POLL_RESPONSE_KEYS if k in content),
+                {}
             ).get("answers", [])
 
             # Menü-Poll?
@@ -1191,7 +1192,7 @@ class TeamBot:
     async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
         """Poll posten und event_id zurückgeben."""
         resp = await self.client.room_send(
-            room_id, "org.matrix.msc3381.poll.start", content
+            room_id, POLL_EVENT_TYPE, content
         )
         if isinstance(resp, RoomSendResponse):
             return resp.event_id
@@ -1218,31 +1219,13 @@ class TeamBot:
             f"{cfg.game_hour:02d}:{cfg.game_minute:02d} Uhr"
         )
 
-        poll_content = {
-            "msgtype": "m.text",
-            "body": f"📊 {title}\n✅ Dabei / ❌ Nicht dabei",
-            "org.matrix.msc3381.poll.start": {
-                "kind": "org.matrix.msc3381.poll.disclosed",
-                "max_selections": 1,
-                "question": {"body": f"⚽ {title}"},
-                "answers": [
-                    {"id": "yes", "org.matrix.msc3381.poll.answer.text": "✅ Dabei"},
-                    {"id": "no",  "org.matrix.msc3381.poll.answer.text": "❌ Nicht dabei"},
-                ],
-            },
-            "m.poll.start": {
-                "kind": "m.poll.disclosed",
-                "max_selections": 1,
-                "question": {"body": f"⚽ {title}"},
-                "answers": [
-                    {"id": "yes", "m.text": "✅ Dabei"},
-                    {"id": "no",  "m.text": "❌ Nicht dabei"},
-                ],
-            },
-        }
+        poll_content = make_poll(
+            f"⚽ {title}",
+            [("yes", "✅ Dabei"), ("no", "❌ Nicht dabei")],
+        )
 
         resp = await self.client.room_send(
-            self.config.room_id, "org.matrix.msc3381.poll.start", poll_content
+            self.config.room_id, POLL_EVENT_TYPE, poll_content
         )
         if isinstance(resp, RoomSendResponse):
             vote_date = game_date.strftime("%Y-%m-%d")
@@ -1289,14 +1272,6 @@ class TeamBot:
     async def _post_proposal_poll(self, room_id: Optional[str] = None):
         """Alle Vorschläge als Matrix-Poll zur Abstimmung stellen."""
         letters = sorted(self._proposals.keys())
-        answers_msc = [
-            {"id": l, "org.matrix.msc3381.poll.answer.text": f"Vorschlag {l}"}
-            for l in letters
-        ]
-        answers_stable = [
-            {"id": l, "m.text": f"Vorschlag {l}"}
-            for l in letters
-        ]
 
         # Kurze Vorschau pro Option
         preview_lines = []
@@ -1307,31 +1282,18 @@ class TeamBot:
             t1_names = gk1_name + " " + " ".join(p["display_name"] for p in t1f)
             t2_names = gk2_name + " " + " ".join(p["display_name"] for p in t2f)
             preview_lines.append(
-                f"**{l}:** 🟡 {t1_names.strip()}  vs  🌈 {t2_names.strip()}"
+                f"{l}: 🟡 {t1_names.strip()}  vs  🌈 {t2_names.strip()}"
             )
 
         preview = "\n".join(preview_lines)
-        title = "Welche Mannschaftsaufteilung?"
 
-        poll_content = {
-            "msgtype": "m.text",
-            "body": f"🗳️ {title}\n\n{preview}",
-            "org.matrix.msc3381.poll.start": {
-                "kind": "org.matrix.msc3381.poll.disclosed",
-                "max_selections": 1,
-                "question": {"body": f"🗳️ {title}"},
-                "answers": answers_msc,
-            },
-            "m.poll.start": {
-                "kind": "m.poll.disclosed",
-                "max_selections": 1,
-                "question": {"body": f"🗳️ {title}"},
-                "answers": answers_stable,
-            },
-        }
+        poll_content = make_poll(
+            "Welche Mannschaftsaufteilung?",
+            [(l, f"Vorschlag {l}") for l in letters],
+        )
 
         resp = await self.client.room_send(
-            self.config.room_id, "org.matrix.msc3381.poll.start", poll_content
+            self.config.room_id, POLL_EVENT_TYPE, poll_content
         )
         if isinstance(resp, RoomSendResponse):
             self._proposal_poll_id = resp.event_id
@@ -1341,7 +1303,6 @@ class TeamBot:
                 f"Um 10:00 Uhr wird der meistgewählte Vorschlag aktiviert.\n"
                 f"Oder jetzt wählen: `!team A`, `!team B`, …"
             , room_id)
-
         else:
             logger.error("Proposal poll konnte nicht gepostet werden: %s", resp)
 
