@@ -376,13 +376,9 @@ class TeamBot:
 
         content = event.source.get("content", {})
 
-        # Poll-Responses immer verarbeiten – auch vom poll_sender
-        # (poll_sender stimmt als normaler User ab, das muss gezählt werden)
-        if event.type in POLL_RESPONSE_TYPES:
-            # Filter nur für m.reaction (nicht für Poll-Responses)
-            pass
-        elif self.config.poll_sender_id and event.sender == self.config.poll_sender_id:
-            return  # Reactions vom poll_sender ignorieren (keine Loop)
+        # Poll-Responses und Reactions vom poll_sender sind erlaubt –
+        # er stimmt ab und reagiert wie jeder andere User.
+        # Nur eigene Bot-Events ignorieren (bereits oben gefiltert).
 
         # Native Matrix-Poll-Antwort
         if event.type in POLL_RESPONSE_TYPES:
