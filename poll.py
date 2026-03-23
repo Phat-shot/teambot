@@ -33,6 +33,8 @@ def make_poll(
             "max_selections": max_selections,
             "question": {
                 "org.matrix.msc1767.text": question,
+                "body": question,
+                "msgtype": "m.text",
             },
             "answers": [
                 {
