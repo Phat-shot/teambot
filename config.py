@@ -9,7 +9,8 @@ class Config:
     user_id: str
     password: str
     room_id: str        # Hauptraum (Announcements + öffentliche Befehle)
-    admin_room_id: str  # Admin-Raum: alle Mitglieder haben Admin-Rechte
+    admin_room_id: str = ""  # Admin-Raum (leer = kein dedizierter Admin-Raum)
+    poll_sender: str = ""   # Matrix-ID über die Polls gesendet werden (für WA-Bridge), leer = Bot selbst
 
     # Storage
     db_path: str = "data/teambot.db"
@@ -36,6 +37,7 @@ class Config:
 def load_config(path: str = "config.yml") -> Config:
     with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    # Rückwärtskompatibilität: admin_users wird ignoriert falls noch vorhanden
-    data.pop("admin_users", None)
+    # Unbekannte / veraltete Keys entfernen damit Config(**data) nie crasht
+    known = {f.name for f in Config.__dataclass_fields__.values()}
+    data = {k: v for k, v in data.items() if k in known}
     return Config(**data)

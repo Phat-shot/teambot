@@ -1190,14 +1190,31 @@ class TeamBot:
             logger.warning("Redact fehlgeschlagen %s: %s", event_id, exc)
 
     async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
-        """Poll posten und event_id zurückgeben."""
-        resp = await self.client.room_send(
-            room_id, POLL_EVENT_TYPE, content
-        )
-        if isinstance(resp, RoomSendResponse):
-            return resp.event_id
-        logger.error("Poll fehlgeschlagen: %s", resp)
-        return None
+        """Poll posten – wenn poll_sender gesetzt, als diesen User senden (WA-Bridge Workaround)."""
+        poll_sender = self.config.poll_sender
+
+        if poll_sender:
+            # Appservice-Impersonation über ?user_id= Query-Parameter
+            # Erlaubt nur für als Appservice registrierte Bots
+            import uuid
+            txn_id = f"poll_{uuid.uuid4().hex}"
+            path = f"/_matrix/client/v3/rooms/{room_id}/send/org.matrix.msc3381.poll.start/{txn_id}"
+            resp = await self.client._send(
+                "PUT",
+                path,
+                content,
+                query_parameters={"user_id": poll_sender},
+            )
+            if resp and "event_id" in resp:
+                return resp["event_id"]
+            logger.error("Poll (impersonated) fehlgeschlagen: %s", resp)
+            return None
+        else:
+            resp = await self.client.room_send(room_id, POLL_EVENT_TYPE, content)
+            if isinstance(resp, RoomSendResponse):
+                return resp.event_id
+            logger.error("Poll fehlgeschlagen: %s", resp)
+            return None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Scheduled jobs
@@ -1224,21 +1241,19 @@ class TeamBot:
             [("yes", "✅ Dabei"), ("no", "❌ Nicht dabei")],
         )
 
-        resp = await self.client.room_send(
-            self.config.room_id, POLL_EVENT_TYPE, poll_content
-        )
-        if isinstance(resp, RoomSendResponse):
+        event_id = await self._post_poll(self.config.room_id, poll_content)
+        if event_id:
             vote_date = game_date.strftime("%Y-%m-%d")
-            vote_id   = await self.db.create_vote(resp.event_id, vote_date)
-            logger.info("Poll gestartet – event_id=%s vote_id=%d", resp.event_id, vote_id)
-            self._reset_proposals()   # Neue Woche → Vorschläge zurücksetzen
+            vote_id   = await self.db.create_vote(event_id, vote_date)
+            logger.info("Poll gestartet – event_id=%s vote_id=%d", event_id, vote_id)
+            self._reset_proposals()
             await self.send(
                 f"🗳️ Vote gestartet!\n"
                 f"Abstimmen mit ✅ / ❌ im Poll.\n"
                 f"🧤 Als Torwart melden: `!gk` schreiben."
             )
         else:
-            logger.error("Poll konnte nicht gepostet werden: %s", resp)
+            logger.error("Poll konnte nicht gepostet werden")
 
     async def _scheduled_teams(self):
         logger.info("Automatische Team-Generierung ausgelöst")
@@ -1292,11 +1307,9 @@ class TeamBot:
             [(l, f"Vorschlag {l}") for l in letters],
         )
 
-        resp = await self.client.room_send(
-            self.config.room_id, POLL_EVENT_TYPE, poll_content
-        )
-        if isinstance(resp, RoomSendResponse):
-            self._proposal_poll_id = resp.event_id
+        event_id = await self._post_poll(self.config.room_id, poll_content)
+        if event_id:
+            self._proposal_poll_id = event_id
             self._proposal_votes   = {}
             await self.send(
                 f"📋 Vorschläge zur Abstimmung:\n{preview}\n\n"
@@ -1304,7 +1317,7 @@ class TeamBot:
                 f"Oder jetzt wählen: `!team A`, `!team B`, …"
             , room_id)
         else:
-            logger.error("Proposal poll konnte nicht gepostet werden: %s", resp)
+            logger.error("Proposal poll konnte nicht gepostet werden")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Team-Slot-Hilfsmethoden
