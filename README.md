@@ -9,12 +9,12 @@ Matrix-Bot für die wöchentliche Fußball-Teamaufstellung. Erstellt automatisch
 | Feature | Details |
 |---|---|
 | 🗳️ **Wöchentlicher Vote** | Samstag 12:00 – Bot postet automatisch einen Poll |
-| ✅ **Abstimmung** | Spieler stimmen per nativen Matrix-Poll ab (✅ Dabei / ❌ Nicht dabei) |
+| ✅ **Abstimmung** | Spieler stimmen per nativen Matrix-Poll ab |
 | 🧤 **GK-Meldung** | Spieler melden sich mit `!gk` freiwillig als Torwart |
-| ⚽ **Team-Generierung** | Sonntag 09:00 automatisch oder per `!team` |
-| ⚖️ **Score-Balancing** | Teams werden nach Spieler-Scores optimal ausgeglichen |
-| 🔄 **Score-Berechnung** | 50 % Gesamt · 30 % letzte 3 Monate · 20 % letztes Match |
-| 🌐 **Web-API** | FastAPI-Endpunkte für spätere Weboberfläche bereits vorbereitet |
+| ⚽ **Team-Vorschläge** | Mehrere Vorschläge A/B/C generieren und abstimmen |
+| ⚖️ **Score-Balancing** | Teams werden nach effektivem Score optimal ausgeglichen |
+| 🤖 **Interaktives Menü** | `!cmd` öffnet geführtes Poll-Menü im Admin-Raum |
+| 🌐 **Web-API** | FastAPI-Endpunkte für spätere Weboberfläche vorbereitet |
 
 ---
 
@@ -24,29 +24,24 @@ Jeder Spieler hat zwei Scores (0–10, Schrittweite 0,01):
 
 | Score | Beschreibung |
 |---|---|
-| `field` | Feldspieler-Stärke – wird für das Team-Balancing verwendet |
-| `gk` | Torwart-Qualität – wird nur für die GK-Zuweisung und GK-Wertung verwendet |
+| `field` | Feldspieler-Stärke |
+| `gk` | Torwart-Qualität (nur für GK-fähige Spieler relevant) |
 
-### Torwart-Zuweisung (automatisch bei `!team`)
-
-1. **Freiwillige** – Spieler die `!gk` geschrieben haben, sortiert nach GK-Score
-2. **GK-fähige Spieler** – Spieler mit aktivierter GK-Fähigkeit, sortiert nach GK-Score
-3. **Fallback** – schwächster Feldspieler (niedrigster `field`-Score) pro Team
+**Effektiver Score** für Balancing und Zuweisung:
+- `can_gk = false` → `field`
+- `can_gk = true` → `0,5 × field + 0,5 × gk`
 
 ### Score-Neuberechnung nach `!result`
 
 ```
-neuer_score = Ø_gesamt × 0,50
-            + Ø_letzte_3_Monate × 0,30
-            + letztes_Match × 0,20
+neuer_score = letzter_score × 0,50
+            + Ø_letzte_5_Spiele × 0,30
+            + letztes_Spiel × 0,20
 ```
 
-Feldspieler und GKs werden **getrennt** bewertet:
-- `field`-Score wird nur aktualisiert wenn der Spieler als Feldspieler gespielt hat
-- `gk`-Score wird nur aktualisiert wenn der Spieler als Torwart gespielt hat
+Der **letzte berechnete Score** (nicht der Durchschnitt aller Spiele) ist die Basis. Das führt zu gleichmäßigem Konvergenzverhalten ähnlich einem ELO-System. `field` und `gk` werden getrennt berechnet – nur wenn der Spieler in der jeweiligen Rolle gespielt hat.
 
-**Match-Score** aus Tordifferenz: `score = clamp(5 + tordifferenz, 0, 10)`
-Beispiel: gewonnen +3 → 8,0 · Unentschieden → 5,0 · verloren −3 → 2,0
+**Match-Score** aus Tordifferenz: `clamp(5 + tordifferenz, 0, 10)`
 
 ---
 
@@ -56,37 +51,56 @@ Beispiel: gewonnen +3 → 8,0 · Unentschieden → 5,0 · verloren −3 → 2,0
 
 | Befehl | Beschreibung |
 |---|---|
-| `!player` | Spielerliste mit Feld- und GK-Score |
+| `!player` | Spielerliste mit Scores und Matrix-ID |
 | `!match [N]` | Letzte 5 (oder N) Ergebnisse |
 | `!gk` | Als Torwart für dieses Spiel melden |
 | `!kein_gk` | GK-Meldung zurückziehen |
-| `!team` | Teams aus dem aktuellen Vote generieren |
+| `!team` | Neuen Team-Vorschlag generieren (A, B, C, …) |
+| `!team A` | Vorschlag A aktivieren |
+| `!team vote` | Alle Vorschläge zur Abstimmung stellen |
 | `!help` | Alle Befehle anzeigen |
 
-### Admin – Spieler-Stammdaten
+### Admin – Interaktiv (nur im Admin-Raum)
 
 | Befehl | Beschreibung |
 |---|---|
-| `!player add @user:server Name` | Spieler anlegen |
-| `!player add @user:server Name gk` | Spieler anlegen (Torwart-fähig) |
-| `!player set @user:server 7.5` | Feldspieler-Score setzen (Standard) |
-| `!player set @user:server field 7.5` | Feldspieler-Score setzen (explizit) |
-| `!player set @user:server gk 8.0` | Torwart-Score setzen |
-| `!player gk @user:server` | GK-Fähigkeit ein/aus (Score bleibt erhalten) |
-| `!player del @user:server` | Spieler deaktivieren |
+| `!cmd` | Interaktives Menü via Poll starten |
 
-### Admin – Aktuelles Spiel (nach `!team`)
+Das Menü führt durch drei Kategorien:
+
+**👤 Spieler** – Spieler anlegen, Scores setzen, GK-Fähigkeit, deaktivieren
+
+**⚽ Spieltag** – Teams generieren, Vorschläge, Gäste, Korrekturen, Ergebnis, Vote
+
+**📊 Auswertung** – Spielerliste, Match-Historie, Scores
+
+Bei Befehlen die einen Namen/Wert benötigen, wird die nächste Nachricht als Eingabe verwendet. Polls werden nach Auswahl automatisch gelöscht.
+
+### Admin – Direkte Befehle
+
+Name oder `@user:server` sind überall möglich.
+
+**Spieler-Stammdaten**
 
 | Befehl | Beschreibung |
 |---|---|
-| `!match change Name1 Name2` | Zwei Spieler zwischen den Teams tauschen |
-| `!match change Name` | Spieler ins andere Team verschieben |
+| `!player add @user:server [Name] [gk]` | Spieler anlegen – ohne Name: Matrix-Anzeigename |
+| `!player set Name 7.5` | Feldspieler-Score setzen (Standard) |
+| `!player set Name field 7.5` | Feldspieler-Score setzen (explizit) |
+| `!player set Name gk 8.0` | Torwart-Score setzen |
+| `!player gk Name` | GK-Fähigkeit ein/aus (Score bleibt erhalten) |
+| `!player del Name` | Spieler deaktivieren |
+
+**Aktuelles Spiel**
+
+| Befehl | Beschreibung |
+|---|---|
+| `!match guest "Name" [Score]` | Gastspieler hinzufügen (kein Score-Update) |
+| `!match change Name1 [Name2]` | Spieler tauschen oder verschieben |
 | `!match gk Name` | Spieler als Torwart seines Teams setzen |
-| `!match switched Name` | Spieler von Score-Wertung aus-/einschließen (Toggle) |
+| `!match switched Name` | Score-Wertung ein-/ausschalten (Toggle) |
 
-> Wenn ein Torwart per `!match change` verschoben wird, übernimmt automatisch der schwächste Feldspieler des verlassenen Teams die GK-Position.
-
-### Admin – Ergebnis & Vote
+**Ergebnis & Vote**
 
 | Befehl | Beschreibung |
 |---|---|
@@ -102,10 +116,15 @@ Samstag 12:00  →  Bot postet Poll "Kicken Morgen, 23.03.2025 um 10:00"
                    Spieler stimmen mit ✅ / ❌ ab
                    Wer Torwart spielen möchte: !gk schreiben
 
-Sonntag 09:00  →  Bot generiert automatisch die Teams
-                   (oder manuell per !team)
+Sonntag 09:00  →  Bot generiert automatisch Vorschlag A
+                   !team für Vorschlag B, C, …
+                   !team vote → Abstimmung unter allen Vorschlägen
 
-Bei Bedarf     →  Admin korrigiert mit !match change / !match gk
+Sonntag 10:00  →  Meistgewählter Vorschlag wird automatisch aktiviert
+                   (oder manuell: !team A / !team B)
+
+Bei Bedarf     →  Korrekturen mit !match change / !match gk
+                   Gastspieler: !match guest "Name"
 
 Nach dem Spiel →  Admin: !result 3:2
                    Bot postet Ergebnis und aktualisiert alle Scores
@@ -122,50 +141,68 @@ git clone https://github.com/Phat-shot/Teambot.git
 cd Teambot
 ```
 
-### 2. Konfiguration anlegen
+### 2. Räume anlegen
+
+Zwei Matrix-Räume erstellen – **beide ohne E2E-Verschlüsselung**:
+
+- **Hauptraum** – für alle Spieler (Vote, Teams, Ergebnisse)
+- **Admin-Raum** – privat, nur für Admins (alle Mitglieder = Admin)
+
+### 3. Konfiguration anlegen
 
 ```bash
 cp config.yml.example config.yml
 nano config.yml
 ```
 
-| Feld | Beispiel | Beschreibung |
-|---|---|---|
-| `homeserver` | `https://matrix.example.org` | URL des Matrix-Homeservers |
-| `user_id` | `@teambot:example.org` | Matrix-ID des Bot-Accounts |
-| `password` | `geheimes-pw` | Passwort des Bot-Accounts |
-| `room_id` | `!abc123:example.org` | Interne Raum-ID (Einstellungen → Erweitert) |
-| `admin_users` | `@du:example.org` | Matrix-IDs der Admins |
+| Feld | Beschreibung |
+|---|---|
+| `homeserver` | URL des Matrix-Homeservers |
+| `user_id` | Matrix-ID des Bot-Accounts |
+| `password` | Passwort des Bot-Accounts |
+| `room_id` | Raum-ID des Hauptraums |
+| `admin_room_id` | Raum-ID des Admin-Raums |
 
-> ⚠️ Den Bot-Account **nicht** verschlüsseln – Bot-Räume sollten ohne E2E-Verschlüsselung betrieben werden.
+Raum-IDs findest du unter: Raum → Einstellungen → Erweitert → Interne Raum-ID
 
-### 3. Starten (Docker)
+### 4. Starten (Docker)
 
 ```bash
-# Nur Bot:
+docker compose pull teambot
 docker compose up -d teambot
-
-# Bot + Web-API:
-docker compose --profile api up -d
 ```
 
-### 4. Bot in Raum einladen
+### 5. Bot einladen
 
-Im Matrix-Client: `/invite @teambot:example.org`
+In beiden Räumen: `/invite @teambot:example.org`
 
-Der Bot tritt automatisch bei und schreibt eine Begrüßung.
+Der Bot tritt automatisch bei. Wer im Admin-Raum ist, hat automatisch Admin-Rechte.
 
-### 5. Ersten Spieler anlegen
+### Updates
 
+```bash
+docker compose pull teambot && docker compose up -d teambot
 ```
-!player add @deinname:example.org Name
-```
+
+---
+
+## Räume & Berechtigungen
+
+| Raum | Wer | Was |
+|---|---|---|
+| Hauptraum | Alle Spieler | Vote abstimmen, `!gk`, `!team`, `!player`, `!match` lesen |
+| Admin-Raum | Admins | `!cmd`, alle schreibenden Befehle, direkte Commands |
+| Beide Räume | Admins | Direkte Commands funktionieren überall |
+
+Announcements (Vote Sa 12:00, Teams So 09:00, Ergebnis) gehen immer in den **Hauptraum**.
 
 ---
 
 ## Web-API (Phase 2)
 
-Wenn die API aktiviert ist (`docker compose --profile api up`):
+```bash
+docker compose --profile api up -d
+```
 
 ```
 GET http://localhost:8080/players        → Alle aktiven Spieler
@@ -179,7 +216,7 @@ GET http://localhost:8080/health         → Status
 ## Datenbankstruktur
 
 ```
-players              – Spieler, field-Score, GK-Score, GK-Fähigkeit
+players              – Spieler, field/gk-Score, base-Scores, GK-Fähigkeit
 matches              – Matchergebnisse inkl. Torwart-IDs
 match_participations – Score-Protokoll pro Spieler/Match (GK-Flag)
 votes                – Abstimmungsnachrichten (Matrix Event-IDs)
@@ -187,20 +224,15 @@ vote_responses       – Abstimmungs-Antworten der Spieler
 gk_requests          – !gk Meldungen pro Vote
 ```
 
-Die SQLite-Datenbank liegt unter `data/teambot.db` und wird per Docker-Volume persistiert. Beim Update auf eine neue Version wird die Datenbank automatisch migriert – keine Datenverluste.
+Beim Update wird die Datenbank automatisch migriert. Die Datei liegt unter `data/teambot.db` und wird per Docker-Volume persistiert.
 
 ---
 
 ## Entwicklung
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Konfiguration anlegen (wird interaktiv erstellt falls nicht vorhanden):
-python main.py
-
-# Lokaler Selbsttest (ohne Matrix-Verbindung):
-python test_local.py
+python main.py          # startet interaktiven Setup-Assistenten wenn keine config.yml
+python test_local.py    # Selbsttest ohne Matrix-Verbindung
 ```

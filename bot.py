@@ -44,6 +44,7 @@ from nio import (
 
 from config import Config
 from db import Database
+from menu import MenuManager, category_poll_content, command_poll_content, parse_category_answer, parse_command_answer
 from teams import build_teams, format_teams, effective_score, TEAM1_NAME, TEAM2_NAME
 
 TEAM1_LABEL = TEAM1_NAME
@@ -68,35 +69,34 @@ HELP_TEXT = """\
 `!team vote`     – Alle Vorschläge zur Abstimmung stellen
 `!help`          – Diese Hilfe
 
-**Admin – Spieler-Stammdaten** _(Name oder @user:server möglich)_
-`!player add @user:server Name`      – Spieler anlegen
-`!player add @user:server Name gk`   – Spieler anlegen (Torwart-fähig)
+**Admin – Interaktiv (nur im Admin-Raum)**
+`!cmd`           – Interaktives Menü via Poll starten
+                   Kategorien: Spieler · Spieltag · Auswertung
+
+**Admin – Direkte Befehle** _(Name oder @user:server möglich)_
+`!player add @user:server [gk]`      – Spieler anlegen
 `!player set Name 7.5`               – Feldspieler-Score setzen
 `!player set Name field 7.5`         – Feldspieler-Score setzen (explizit)
 `!player set Name gk 8.0`            – Torwart-Score setzen
 `!player gk Name`                    – GK-Fähigkeit ein/aus (Score bleibt)
 `!player del Name`                   – Spieler deaktivieren
 
-**Admin – Aktuelles Spiel** _(Name oder @user:server möglich)_
-`!match guest "Name" [Score]`  – Gastspieler hinzufügen (nur für dieses Spiel)
-`!match change Name1 Name2`    – Zwei Spieler tauschen
-`!match change Name`           – Spieler ins andere Team verschieben
-`!match gk Name`               – Spieler als Torwart seines Teams setzen
-`!match switched Name`         – Score-Wertung ein-/ausschalten (Toggle)
+`!match change Name1 [Name2]`        – Spieler tauschen/verschieben
+`!match gk Name`                     – Torwart setzen
+`!match switched Name`               – Score-Wertung ein-/ausschalten
+`!match guest "Name" [Score]`        – Gastspieler hinzufügen
 
-**Admin – Ergebnis & Vote**
-`!result 3:2`  – Ergebnis + Score-Update
-`!vote`        – Vote sofort starten
+`!result 3:2`                        – Ergebnis + Score-Update
+`!vote`                              – Vote sofort starten
 
 **Score-System**
 🟡 Team Gelb  vs  🌈 Team Bunt
-Feldspieler: `field` · GK-fähige Spieler: `0,5 × field + 0,5 × gk`
+Feldspieler: `field` · GK-fähig: `0,5 × field + 0,5 × gk`
 Neuberechnung: 50 % letzter Score · 30 % letzte 5 Spiele · 20 % letztes Spiel
-Gäste (👤) erhalten keinen Score-Eintrag.
 
 **Torwart-Zuweisung**
 ① Freiwillige (`!gk`) nach GK-Score
-② GK-fähige Spieler nach GK-Score
+② GK-fähige Spieler nach GK-Score  
 ③ Fallback: schwächster Spieler pro Team
 """
 
@@ -124,6 +124,9 @@ class TeamBot:
         self._active_proposal:   Optional[str]    = None
         self._proposal_poll_id:  Optional[str]    = None   # Matrix event_id des Vorschlags-Polls
         self._proposal_votes:    Dict[str, int]   = {}     # letter → Stimmenzahl
+
+        # Interaktives Admin-Menü
+        self._menu = MenuManager()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Start
@@ -274,6 +277,12 @@ class TeamBot:
             return
 
         body = event.body.strip()
+
+        # Menü-Freitext-Eingabe hat Priorität vor Commands
+        if self._menu.awaiting_text(room.room_id, event.sender):
+            await self._menu_handle_text(room.room_id, body, event.sender)
+            return
+
         if not body.startswith("!"):
             return
 
@@ -290,6 +299,13 @@ class TeamBot:
                     await self._handle_match(args, event.sender, room_id)
                 case "!result":
                     await self._handle_result(args, event.sender, room_id)
+                case "!cmd":
+                    if room.room_id == self.config.admin_room_id and self._is_admin(event.sender):
+                        await self._menu_start(room.room_id, event.sender)
+                    elif not self._is_admin(event.sender):
+                        await self.send("❌ Keine Berechtigung.", room_id)
+                    else:
+                        await self.send("ℹ️ `!cmd` funktioniert nur im Admin-Raum.", room_id)
                 case "!team":
                     if args and args[0].lower() == "vote":
                         await self._cmd_team(post_vote=True, room_id=room_id)
@@ -322,6 +338,16 @@ class TeamBot:
         if event.type in ("org.matrix.msc3381.poll.response", "m.poll.response"):
             relates_to    = content.get("m.relates_to", {})
             poll_event_id = relates_to.get("event_id")
+            answers = (
+                content.get("org.matrix.msc3381.poll.response", {})
+                or content.get("m.poll.response", {})
+            ).get("answers", [])
+
+            # Menü-Poll?
+            state = self._menu.get(room.room_id)
+            if state and poll_event_id in state.poll_event_ids and event.sender == state.user:
+                await self._menu_handle_vote(room.room_id, state, poll_event_id, answers)
+                return
 
             # Proposal-Poll?
             if poll_event_id == self._proposal_poll_id:
@@ -396,23 +422,27 @@ class TeamBot:
             return await self.send("❌ Keine Berechtigung.", room_id)
 
         if sub == "add":
-            # add benötigt immer Matrix-ID (neuer Spieler, Name noch nicht in DB)
-            if len(args) < 3:
+            # add: Matrix-ID erforderlich, Name optional (wird aus Profil gelesen)
+            if len(args) < 2:
                 return await self.send(
-                    "Syntax: `!player add @user:server Name [gk]`\n"
-                    "`gk` am Ende = Spieler kann Torwart spielen.\n"
-                    "Hinweis: `add` benötigt immer die Matrix-ID."
+                    "Syntax: `!player add @user:server [Name] [gk]`\n"
+                    "Ohne Namen wird der Matrix-Anzeigename automatisch verwendet."
                 , room_id)
 
             matrix_id = args[1]
-            name      = args[2]
-            can_gk    = len(args) > 3 and args[3].lower() == "gk"
+            if not matrix_id.startswith("@"):
+                return await self.send("❌ Erstes Argument muss eine Matrix-ID sein (beginnt mit @).", room_id)
+
+            rest = args[2:]
+            can_gk = "gk" in [a.lower() for a in rest]
+            name_parts = [a for a in rest if a.lower() != "gk"]
+            name = " ".join(name_parts) if name_parts else await self._get_display_name(matrix_id)
 
             if await self.db.get_player(matrix_id):
                 return await self.send(f"⚠️ `{matrix_id}` existiert bereits.", room_id)
             await self.db.add_player(matrix_id, name, can_gk)
             hint = " 🧤 (Torwart-fähig)" if can_gk else ""
-            await self.send(f"✅ **{name}** hinzugefügt{hint}.", room_id)
+            await self.send(f"✅ **{name}** (`{matrix_id}`){hint} hinzugefügt.", room_id)
 
         elif sub == "set":
             # !player set @id|Name 7.5           → field (Standard)
@@ -948,6 +978,225 @@ class TeamBot:
         else:
             await self.db.remove_gk_request(vote["id"], sender)
             await self.send("👍 GK-Meldung zurückgezogen.", room_id)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Interaktives Admin-Menü
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _menu_start(self, room_id: str, sender: str):
+        """!cmd → Kategorie-Poll posten."""
+        # Alten State aufräumen
+        old = self._menu.get(room_id)
+        if old:
+            await self._menu_redact_all(room_id, old)
+
+        state = self._menu.start(room_id, sender)
+        poll_id = await self._post_poll(room_id, category_poll_content())
+        if poll_id:
+            state.poll_event_ids.append(poll_id)
+
+    async def _menu_handle_vote(self, room_id: str, state, poll_event_id: str, answers: list):
+        """Poll-Antwort verarbeiten."""
+        if not answers:
+            return
+        answer = answers[0]
+
+        if state.level == 1:
+            # Kategorie gewählt
+            cat = parse_category_answer(answer)
+            if not cat:
+                return
+            state.category = cat
+            state.level = 2
+
+            # Kategorie-Poll löschen
+            await self._redact(room_id, poll_event_id)
+
+            # Command-Poll posten
+            poll_id = await self._post_poll(room_id, command_poll_content(cat))
+            if poll_id:
+                state.poll_event_ids.append(poll_id)
+
+        elif state.level == 2:
+            # Command gewählt
+            from menu import parse_command_answer
+            item = parse_command_answer(state.category, answer)
+            if not item:
+                return
+            state.command = item.cmd
+
+            # Command-Poll löschen
+            await self._redact(room_id, poll_event_id)
+
+            if item.prompt:
+                # Freitext nötig
+                state.level = 3
+                hint = f"\n_{item.hint}_" if item.hint else ""
+                prompt_id = await self.send(
+                    f"✏️ **{item.label}**\n{item.prompt}{hint}", room_id
+                )
+                state.prompt_msg_id = prompt_id
+            else:
+                # Direkt ausführen
+                await self._menu_execute(room_id, state, "")
+                self._menu.clear(room_id)
+
+    async def _menu_handle_text(self, room_id: str, text: str, sender: str):
+        """Freitext-Eingabe nach Poll-Auswahl verarbeiten."""
+        state = self._menu.get(room_id)
+        if not state or state.level != 3:
+            return
+
+        # Prompt-Nachricht löschen
+        if state.prompt_msg_id:
+            await self._redact(room_id, state.prompt_msg_id)
+
+        await self._menu_execute(room_id, state, text.strip())
+        self._menu.clear(room_id)
+
+    async def _menu_execute(self, room_id: str, state, text: str):
+        """Command ausführen basierend auf Auswahl und Freitext."""
+        cmd = state.command
+
+        try:
+            match cmd:
+                # ── Spieler ──────────────────────────────────────────────
+                case "player_add":
+                    await self._menu_player_add(room_id, text, state.user)
+
+                case "player_set_field":
+                    parts = text.split()
+                    if len(parts) < 2:
+                        return await self.send("❌ Format: `Name Score`", room_id)
+                    score_str = parts[-1]
+                    name = " ".join(parts[:-1])
+                    await self._handle_player(["set", name, "field", score_str], state.user, room_id)
+
+                case "player_set_gk":
+                    parts = text.split()
+                    if len(parts) < 2:
+                        return await self.send("❌ Format: `Name Score`", room_id)
+                    score_str = parts[-1]
+                    name = " ".join(parts[:-1])
+                    await self._handle_player(["set", name, "gk", score_str], state.user, room_id)
+
+                case "player_toggle_gk":
+                    await self._handle_player(["gk", text], state.user, room_id)
+
+                case "player_del":
+                    await self._handle_player(["del", text], state.user, room_id)
+
+                # ── Spieltag ─────────────────────────────────────────────
+                case "team_next":
+                    await self._cmd_team(room_id=room_id)
+
+                case "team_alt":
+                    await self._cmd_team(room_id=room_id)
+
+                case "team_select":
+                    letter = text.strip().upper()
+                    await self._cmd_team(select_letter=letter, room_id=room_id)
+
+                case "team_vote":
+                    await self._cmd_team(post_vote=True, room_id=room_id)
+
+                case "match_guest":
+                    args = text.split()
+                    await self._match_guest(args, room_id=room_id)
+
+                case "match_change":
+                    args = text.split()
+                    await self._match_change(args, room_id=room_id)
+
+                case "match_setgk":
+                    await self._match_setgk([text], room_id=room_id)
+
+                case "match_switched":
+                    await self._match_switched([text], room_id=room_id)
+
+                case "result":
+                    await self._handle_result([text], state.user, room_id)
+
+                case "vote":
+                    await self._scheduled_vote()
+
+                # ── Auswertung ───────────────────────────────────────────
+                case "player_list":
+                    await self._player_list(room_id=room_id)
+
+                case "match_history":
+                    await self._match_history(5, room_id=room_id)
+
+                case "scores":
+                    await self._player_list(room_id=room_id)
+
+        except Exception as exc:
+            logger.exception("Menü-Fehler bei cmd=%s", cmd)
+            await self.send(f"❌ Fehler: {exc}", room_id)
+
+    async def _menu_player_add(self, room_id: str, text: str, sender: str):
+        """
+        Spieler hinzufügen – Name optional.
+        Wenn nur Matrix-ID → Display Name aus Matrix-Profil holen.
+        Wenn kein @ → als Name + eigene Matrix-ID des Senders verwenden?
+        Nein: Text ist matrix_id oder Name.
+        Wenn text starts with @ → Matrix-ID, Name aus Profil.
+        Sonst → Name, Matrix-ID muss noch eingegeben werden (Sender-ID fallback).
+        """
+        text = text.strip()
+        if text.startswith("@") and ":" in text:
+            matrix_id = text.split()[0]
+            # Optionales 'gk' am Ende
+            can_gk = "gk" in text.lower().split()[1:] if len(text.split()) > 1 else False
+            # Display Name aus Matrix-Profil holen
+            display_name = await self._get_display_name(matrix_id)
+            if await self.db.get_player(matrix_id):
+                return await self.send(f"⚠️ `{matrix_id}` existiert bereits.", room_id)
+            await self.db.add_player(matrix_id, display_name, can_gk)
+            hint = " 🧤" if can_gk else ""
+            await self.send(f"✅ **{display_name}** (`{matrix_id}`){hint} hinzugefügt.", room_id)
+        else:
+            # Name angegeben, keine Matrix-ID → Fehler mit Hinweis
+            await self.send(
+                "❌ Bitte Matrix-ID angeben (beginnt mit @).\n"
+                "Beispiel: `@max:matrix.srz.one` oder `@max:matrix.srz.one gk`",
+                room_id
+            )
+
+    async def _get_display_name(self, matrix_id: str) -> str:
+        """Display Name aus Matrix-Profil holen, Fallback auf Localpart."""
+        try:
+            resp = await self.client.get_displayname(matrix_id)
+            if hasattr(resp, "displayname") and resp.displayname:
+                return resp.displayname
+        except Exception:
+            pass
+        # Fallback: @localpart:server → localpart
+        return matrix_id.split(":")[0].lstrip("@")
+
+    async def _menu_redact_all(self, room_id: str, state):
+        """Alle offenen Poll-Nachrichten des States löschen."""
+        for eid in state.poll_event_ids:
+            await self._redact(room_id, eid)
+        if state.prompt_msg_id:
+            await self._redact(room_id, state.prompt_msg_id)
+
+    async def _redact(self, room_id: str, event_id: str):
+        """Matrix-Nachricht löschen (redact)."""
+        try:
+            await self.client.room_redact(room_id, event_id, reason="Menü-Auswahl")
+        except Exception as exc:
+            logger.warning("Redact fehlgeschlagen %s: %s", event_id, exc)
+
+    async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
+        """Poll posten und event_id zurückgeben."""
+        resp = await self.client.room_send(
+            room_id, "org.matrix.msc3381.poll.start", content
+        )
+        if isinstance(resp, RoomSendResponse):
+            return resp.event_id
+        logger.error("Poll fehlgeschlagen: %s", resp)
+        return None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Scheduled jobs
