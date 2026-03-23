@@ -35,9 +35,8 @@ def effective_score(player: Dict) -> float:
     return round(field, 2)
 
 
-# ------------------------------------------------------------------
-# GK assignment
-# ------------------------------------------------------------------
+TEAM1_NAME = "Team Gelb 🟡"
+TEAM2_NAME = "Team Bunt 🌈"
 
 def assign_gks(
     players: List[Dict],
@@ -156,37 +155,39 @@ def format_teams(
         if not gk:
             return "  🧤 — (kein Torwart)"
         score = gk.get("score_gk", 5.0)
-        tag = " ⭐" if gk.get("can_gk") else " (Fallback)"
-        return f"  🧤 {gk['display_name']} (GK {score:.2f}){tag}"
+        guest = " 👤" if gk.get("is_guest") else (" ⭐" if gk.get("can_gk") else " (Fallback)")
+        return f"  🧤 {gk['display_name']} (GK {score:.2f}){guest}"
 
     def field_line(p: Dict) -> str:
-        score = effective_score(p)
         label = f"{p.get('score_field', 5.0):.2f}"
         if p.get("can_gk"):
             label += f"/gk{p.get('score_gk', 5.0):.2f}"
-        return f"  ⚽ {p['display_name']} ({label})"
+        guest = " 👤" if p.get("is_guest") else ""
+        return f"  ⚽ {p['display_name']} ({label}){guest}"
 
     t1_total = sum(effective_score(p) for p in t1_field)
     t2_total = sum(effective_score(p) for p in t2_field)
-
     if gk1:
-        t1_total += gk1.get("score_gk", 5.0)
+        t1_total += gk1.get("score_gk", 5.0) if gk1.get("can_gk") or gk1.get("is_guest") else effective_score(gk1)
     if gk2:
-        t2_total += gk2.get("score_gk", 5.0)
+        t2_total += gk2.get("score_gk", 5.0) if gk2.get("can_gk") or gk2.get("is_guest") else effective_score(gk2)
 
     diff = abs(t1_total - t2_total)
-
     lines = [
         "⚽ **Mannschaften** ⚽",
         "",
-        f"🔴 **Team 1**  |  Stärke: {t1_total:.2f}",
+        f"🟡 **{TEAM1_NAME}**  |  Stärke: {t1_total:.2f}",
         gk_line(gk1),
         *[field_line(p) for p in t1_field],
         "",
-        f"🔵 **Team 2**  |  Stärke: {t2_total:.2f}",
+        f"🌈 **{TEAM2_NAME}**  |  Stärke: {t2_total:.2f}",
         gk_line(gk2),
         *[field_line(p) for p in t2_field],
         "",
         f"⚖️ Differenz: {diff:.2f}",
     ]
+    # Gäste-Hinweis
+    all_guests = [p for p in (t1_field + t2_field + [gk1, gk2]) if p and p.get("is_guest")]
+    if all_guests:
+        lines.append(f"👤 Gäste (kein Score-Update): {', '.join(g['display_name'] for g in all_guests)}")
     return "\n".join(lines)

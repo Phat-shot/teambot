@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS players (
     matrix_id    TEXT    UNIQUE NOT NULL,
     display_name TEXT    NOT NULL,
     score_field  REAL    NOT NULL DEFAULT 5.0,
+    score_base   REAL    NOT NULL DEFAULT 5.0,   -- Basis für 50%-Anteil (= letzter berechneter Wert)
     score_gk     REAL    NOT NULL DEFAULT 5.0,
+    score_gk_base REAL   NOT NULL DEFAULT 5.0,   -- GK-Basis
     can_gk       INTEGER NOT NULL DEFAULT 0,
     active       INTEGER NOT NULL DEFAULT 1,
     created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -103,7 +105,9 @@ class Database:
         """Add new columns to existing DB if upgrading from old schema."""
         migrations = [
             "ALTER TABLE players ADD COLUMN score_field REAL NOT NULL DEFAULT 5.0",
+            "ALTER TABLE players ADD COLUMN score_base REAL NOT NULL DEFAULT 5.0",
             "ALTER TABLE players ADD COLUMN score_gk REAL NOT NULL DEFAULT 5.0",
+            "ALTER TABLE players ADD COLUMN score_gk_base REAL NOT NULL DEFAULT 5.0",
             "ALTER TABLE players ADD COLUMN can_gk INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE matches ADD COLUMN team1_gk_id INTEGER",
             "ALTER TABLE matches ADD COLUMN team2_gk_id INTEGER",
@@ -179,16 +183,18 @@ class Database:
             return [dict(r) for r in rows]
 
     async def update_field_score(self, matrix_id: str, score: float):
+        s = round(min(10.0, max(0.0, score)), 2)
         await self._db.execute(
-            "UPDATE players SET score_field = ? WHERE matrix_id = ?",
-            (round(min(10.0, max(0.0, score)), 2), matrix_id),
+            "UPDATE players SET score_field=?, score_base=? WHERE matrix_id=?",
+            (s, s, matrix_id),
         )
         await self._db.commit()
 
     async def update_gk_score(self, matrix_id: str, score: float):
+        s = round(min(10.0, max(0.0, score)), 2)
         await self._db.execute(
-            "UPDATE players SET score_gk = ? WHERE matrix_id = ?",
-            (round(min(10.0, max(0.0, score)), 2), matrix_id),
+            "UPDATE players SET score_gk=?, score_gk_base=? WHERE matrix_id=?",
+            (s, s, matrix_id),
         )
         await self._db.commit()
 
@@ -333,79 +339,80 @@ class Database:
         gk_ids: Optional[List[int]] = None,
     ):
         """
-        Score-Neuberechnung:
-          50 % Basis      (all-time Durchschnitt aller Spiele)
-          30 % Letzte 5   (Durchschnitt der letzten 5 Spiele)
-          20 % Letztes    (letztes Spiel)
-
-        field-Score: nur Spiele als Feldspieler
-        gk-Score:    nur Spiele als Torwart (nur für gk_ids)
+        Score-Neuberechnung (Option 1 – letzter Score als Basis):
+          50 % score_base  (= letzter berechneter Wert, persistiert)
+          30 % Ø letzte 5 Spiele
+          20 % letztes Spiel
         """
         gk_set = set(gk_ids or [])
 
         for pid in player_ids:
             # ── Field score ──────────────────────────────────────────────
-            base_field = await self._scalar(
-                "SELECT AVG(match_score) FROM match_participations WHERE player_id=? AND played_gk=0",
-                (pid,), default=None,
+            async with self._db.execute(
+                "SELECT score_base FROM players WHERE id=?", (pid,)
+            ) as cur:
+                row = await cur.fetchone()
+                base_field = float(row[0]) if row else 5.0
+
+            last5_field = await self._scalar(
+                """SELECT AVG(match_score) FROM (
+                     SELECT mp.match_score FROM match_participations mp
+                     JOIN matches m ON mp.match_id = m.id
+                     WHERE mp.player_id=? AND mp.played_gk=0
+                     ORDER BY m.played_at DESC LIMIT 5
+                   )""",
+                (pid,), default=base_field,
             )
-            if base_field is not None:
-                last5_field = await self._scalar(
+            last1_field = await self._scalar(
+                """SELECT mp.match_score FROM match_participations mp
+                   JOIN matches m ON mp.match_id = m.id
+                   WHERE mp.player_id=? AND mp.played_gk=0
+                   ORDER BY m.played_at DESC LIMIT 1""",
+                (pid,), default=base_field,
+            )
+            new_field = round(
+                min(10.0, max(0.0,
+                    base_field * 0.50 + last5_field * 0.30 + last1_field * 0.20
+                )), 2
+            )
+            await self._db.execute(
+                "UPDATE players SET score_field=?, score_base=? WHERE id=?",
+                (new_field, new_field, pid),
+            )
+
+            # ── GK score ─────────────────────────────────────────────────
+            if pid in gk_set:
+                async with self._db.execute(
+                    "SELECT score_gk_base FROM players WHERE id=?", (pid,)
+                ) as cur:
+                    row = await cur.fetchone()
+                    base_gk = float(row[0]) if row else 5.0
+
+                last5_gk = await self._scalar(
                     """SELECT AVG(match_score) FROM (
                          SELECT mp.match_score FROM match_participations mp
                          JOIN matches m ON mp.match_id = m.id
-                         WHERE mp.player_id=? AND mp.played_gk=0
+                         WHERE mp.player_id=? AND mp.played_gk=1
                          ORDER BY m.played_at DESC LIMIT 5
                        )""",
-                    (pid,), default=base_field,
+                    (pid,), default=base_gk,
                 )
-                last1_field = await self._scalar(
+                last1_gk = await self._scalar(
                     """SELECT mp.match_score FROM match_participations mp
                        JOIN matches m ON mp.match_id = m.id
-                       WHERE mp.player_id=? AND mp.played_gk=0
+                       WHERE mp.player_id=? AND mp.played_gk=1
                        ORDER BY m.played_at DESC LIMIT 1""",
-                    (pid,), default=base_field,
+                    (pid,), default=base_gk,
                 )
-                new_field = round(
+                new_gk = round(
                     min(10.0, max(0.0,
-                        base_field * 0.50 + last5_field * 0.30 + last1_field * 0.20
+                        base_gk * 0.50 + last5_gk * 0.30 + last1_gk * 0.20
                     )), 2
                 )
                 await self._db.execute(
-                    "UPDATE players SET score_field=? WHERE id=?", (new_field, pid)
+                    "UPDATE players SET score_gk=?, score_gk_base=? WHERE id=?",
+                    (new_gk, new_gk, pid),
                 )
-
-            # ── GK score (nur für Spieler die diesmal als GK gespielt haben) ──
-            if pid in gk_set:
-                base_gk = await self._scalar(
-                    "SELECT AVG(match_score) FROM match_participations WHERE player_id=? AND played_gk=1",
-                    (pid,), default=None,
-                )
-                if base_gk is not None:
-                    last5_gk = await self._scalar(
-                        """SELECT AVG(match_score) FROM (
-                             SELECT mp.match_score FROM match_participations mp
-                             JOIN matches m ON mp.match_id = m.id
-                             WHERE mp.player_id=? AND mp.played_gk=1
-                             ORDER BY m.played_at DESC LIMIT 5
-                           )""",
-                        (pid,), default=base_gk,
-                    )
-                    last1_gk = await self._scalar(
-                        """SELECT mp.match_score FROM match_participations mp
-                           JOIN matches m ON mp.match_id = m.id
-                           WHERE mp.player_id=? AND mp.played_gk=1
-                           ORDER BY m.played_at DESC LIMIT 1""",
-                        (pid,), default=base_gk,
-                    )
-                    new_gk = round(
-                        min(10.0, max(0.0,
-                            base_gk * 0.50 + last5_gk * 0.30 + last1_gk * 0.20
-                        )), 2
-                    )
-                    await self._db.execute(
-                        "UPDATE players SET score_gk=? WHERE id=?", (new_gk, pid)
-                    )
 
         await self._db.commit()
         logger.info("Scores neu berechnet für %d Spieler", len(player_ids))
