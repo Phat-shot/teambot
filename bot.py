@@ -36,6 +36,7 @@ from nio import (
     AsyncClient,
     InviteMemberEvent,
     LoginResponse,
+    ReactionEvent,
     RoomMessageText,
     RoomSendResponse,
     SyncResponse,
@@ -162,6 +163,7 @@ class TeamBot:
 
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(self._on_reaction, UnknownEvent)
+        self.client.add_event_callback(self._on_reaction, ReactionEvent)
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
         self.client.add_response_callback(self._on_sync, SyncResponse)
 
@@ -359,7 +361,7 @@ class TeamBot:
         # er stimmt ab und reagiert wie jeder andere User.
         # Nur eigene Bot-Events ignorieren (bereits oben gefiltert).
 
-        # Native Matrix-Poll-Antwort
+        # Native Matrix-Poll-Antwort (UnknownEvent)
         if event.type in POLL_RESPONSE_TYPES:
             relates_to    = content.get("m.relates_to", {})
             poll_event_id = relates_to.get("event_id")
@@ -415,14 +417,19 @@ class TeamBot:
                 await self.db.upsert_vote_response(vote["id"], event.sender, "no")
             return
 
-        # Legacy Emoji-Reaktion
-        if event.type != "m.reaction":
+        # Legacy Emoji-Reaktion (UnknownEvent m.reaction ODER nativer ReactionEvent)
+        if isinstance(event, ReactionEvent):
+            # nio parsed m.reaction nativ → direkte Attribute
+            target_event_id = event.reacts_to
+            key = event.key
+        elif event.type == "m.reaction":
+            relates_to = content.get("m.relates_to", {})
+            if relates_to.get("rel_type") != "m.annotation":
+                return
+            target_event_id = relates_to.get("event_id")
+            key = relates_to.get("key", "")
+        else:
             return
-        relates_to = content.get("m.relates_to", {})
-        if relates_to.get("rel_type") != "m.annotation":
-            return
-        target_event_id = relates_to.get("event_id")
-        key  = relates_to.get("key", "")
 
         # 🔃/🥅/📣/Zahlen auf Admin-Team-Poll → Admin-Aktionen
         if (self._admin_team_poll_id and
@@ -1031,13 +1038,17 @@ class TeamBot:
             if names:
                 switched_note = f"\n🔕 Ohne Wertung: {', '.join(names)}"
 
-        await self.send(
+        result_msg = (
             f"⚽ **Spielergebnis**\n\n"
             f"🟡 {TEAM1_LABEL} **{score1}** – {roster(self._t1_field, self._t1_gk)}\n"
             f"🌈 {TEAM2_LABEL} **{score2}** – {roster(self._t2_field, self._t2_gk)}\n\n"
             f"{result_line}{switched_note}\n\n"
             f"🔄 Scores aktualisiert."
-        , room_id)
+        )
+        await self.send(result_msg, room_id)
+        # Ergebnis auch in Hauptraum ankündigen
+        if room_id != self.config.room_id:
+            await self.send(result_msg, self.config.room_id)
 
 
         self._reset_match_state()
@@ -1143,6 +1154,13 @@ class TeamBot:
         if unknown:
             msg += f"\n\n⚠️ Nicht in DB: {', '.join(unknown)}"
         await self.send(msg, room_id)
+
+        # Team auch in Hauptraum ankündigen (ohne Vorschlag-Hinweise)
+        if room_id != self.config.room_id:
+            main_msg = f"📋 **Vorgeschlagene Teams:**\n\n" + format_teams(t1f, gk1, t2f, gk2)
+            if unknown:
+                main_msg += f"\n\n⚠️ Nicht in DB: {', '.join(unknown)}"
+            await self.send(main_msg, self.config.room_id)
 
         # Admin-Team-Poll in Admin-Gruppe posten
         if self.config.admin_room_id:
