@@ -35,7 +35,7 @@ Im Hauptraum gibt es keine Befehle – alles läuft über Reaktionen auf den Vot
 
 ## Spieler-Aktionen im Hauptraum
 
-Alle Aktionen erfolgen durch **Reaktionen auf den Vote-Poll**:
+Alle Abstimmungs-Aktionen erfolgen durch **Reaktionen auf den Vote-Poll**:
 
 | Reaktion | Aktion |
 |---|---|
@@ -43,9 +43,14 @@ Alle Aktionen erfolgen durch **Reaktionen auf den Vote-Poll**:
 | ❌ | Absage |
 | 🥅 | Als Torwart melden (auch ohne GK-Flag) |
 | 1️⃣–9️⃣ | N Gäste hinzufügen (z.B. 2️⃣ → „[User]s Gast 1", „[User]s Gast 2") |
-| 🔃 | _(auf beliebige Nachricht)_ Ins andere Team wechseln – automatischer Tausch mit ähnlich bewertetem Gegenspieler |
 
 Wer zum ersten Mal ✅ klickt und noch nicht registriert ist, wird automatisch angelegt (Skill 5, kein GK) und erhält eine Willkommensnachricht.
+
+**Reaktion auf die Team-Ankündigung:**
+
+| Reaktion | Aktion |
+|---|---|
+| 🔃 | Ins andere Team wechseln – automatischer Tausch mit ähnlich bewertetem Gegenspieler |
 
 ---
 
