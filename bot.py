@@ -349,35 +349,6 @@ class TeamBot:
             logger.exception("Fehler bei Befehl %s", cmd)
             await self.send(f"❌ Fehler: {exc}", room_id)
 
-    def _resolve_matrix_id(self, sender: str) -> str:
-        """
-        WA-Bridge sendet Responses als @whatsapp_lid-XXX:server.
-        Diese Puppet-IDs auf die echte Matrix-ID zurückführen falls möglich.
-        Bekannte Mappings: poll_sender_id ist die echte ID von Phils WA-Puppet.
-        """
-        if sender.startswith("@whatsapp_"):
-            # Prüfe ob es das Puppet vom poll_sender ist
-            # Die Bridge nutzt fi.mau.double_puppet_source für echte User
-            # Wir mappen einfach alle whatsapp_lid-* auf den poll_sender falls konfiguriert
-            # Bessere Lösung: in DB nachschauen ob ein Spieler mit dieser Matrix-ID existiert
-            pass
-        return sender
-
-    async def _resolve_voter_id(self, sender: str) -> str:
-        """
-        Löst WA-Puppet-IDs auf registrierte Spieler-IDs auf.
-        @whatsapp_lid-XXX → echte Matrix-ID falls Spieler mit dieser Puppet-ID existiert,
-        oder direkt wenn Spieler registriert ist.
-        """
-        # Direkt in DB schauen
-        player = await self.db.get_player(sender)
-        if player:
-            return sender
-
-        # WA-Puppet? Suche Spieler dessen wa_puppet_id passt
-        # Fallback: sender zurückgeben
-        return sender
-
     async def _on_reaction(self, room, event):
         if event.sender == self.config.user_id:
             return
@@ -506,7 +477,7 @@ class TeamBot:
             return
         if relates_to.get("key") != "🔃":
             return
-        if not self._has_active_teams():
+        if not self._has_teams():
             return
 
         sender = event.sender
@@ -1470,7 +1441,7 @@ class TeamBot:
 
     async def _scheduled_teams(self):
         logger.info("Automatische Team-Generierung ausgelöst")
-        await self._cmd_team(room_id=room_id)
+        await self._cmd_team(room_id=self.config.admin_room_id)
 
     async def _scheduled_apply_voted_proposal(self):
         """Sonntag 10:00 – meistgewählten Vorschlag aktivieren."""
@@ -1536,7 +1507,7 @@ class TeamBot:
         """Aktuelles Team als Poll in der Admin-Gruppe posten. Spieler sind die Antworten."""
         if not self.config.admin_room_id:
             return
-        if not self._has_active_teams():
+        if not self._has_teams():
             return
 
         # Alten Admin-Poll löschen
