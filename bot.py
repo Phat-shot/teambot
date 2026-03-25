@@ -597,7 +597,7 @@ class TeamBot:
 
         # Spieler anlegen: Skill 5, kein GK
         player_id = await self.db.add_player(matrix_id, display_name, can_gk=False)
-        await self.db.update_field_score(matrix_id, 5.0)
+        await self.db.update_score(matrix_id, 5.0)
         logger.info("Neuer Spieler auto-registriert: %s (%s)", display_name, matrix_id)
 
         # Willkommensnachricht im Hauptraum mit @-Mention
@@ -627,8 +627,8 @@ class TeamBot:
                 "id":           f"guest_{sender}_{name.lower().replace(' ', '_')}",
                 "matrix_id":    sender,
                 "display_name": name,
-                "score_field":  5.0,
-                "score_gk":     5.0,
+                "score":        5.0,
+                
                 "can_gk":       False,
                 "is_guest":     True,
             }
@@ -641,8 +641,8 @@ class TeamBot:
                     "id":           f"guest_{sender}_{i}",
                     "matrix_id":    sender,
                     "display_name": name,
-                    "score_field":  5.0,
-                    "score_gk":     5.0,
+                    "score":        5.0,
+                    
                     "can_gk":       False,
                     "is_guest":     True,
                 }
@@ -734,12 +734,9 @@ class TeamBot:
             if not p:
                 return await self.send(f"❌ Spieler `{args[1]}` nicht gefunden.", room_id)
 
-            if score_type == "field":
-                await self.db.update_field_score(p["matrix_id"], score)
-                await self.send(f"✅ **{p['display_name']}** – Feld: **{score:.2f}**", room_id)
-            else:
-                await self.db.update_gk_score(p["matrix_id"], score)
-                await self.send(f"✅ **{p['display_name']}** – Torwart: **{score:.2f}**", room_id)
+            if score_type in ("field", "gk"):
+                await self.db.update_score(p["matrix_id"], score)
+                await self.send(f"✅ **{p['display_name']}** – Score: **{score:.2f}**", room_id)
 
         elif sub == "gk":
             # !player gk @id oder Name  →  togglet can_gk
@@ -752,8 +749,7 @@ class TeamBot:
             await self.db.set_can_gk(p["matrix_id"], new_val)
             status = "🧤 aktiviert" if new_val else "⚽ deaktiviert"
             await self.send(
-                f"✅ **{p['display_name']}** – GK-Fähigkeit: **{status}**\n"
-                f"GK-Score bleibt: {p.get('score_gk', 5.0):.2f}"
+                f"✅ **{p['display_name']}** – GK-Bevorzugung: **{status}**"
             , room_id)
 
 
@@ -779,14 +775,14 @@ class TeamBot:
             return await self.send("Noch keine Spieler in der Datenbank.", room_id)
 
         lines = ["**👥 Spieler & Scores**", ""]
-        lines.append(f"{'Name':<18} {'Feld':>6}  {'GK':>6}  {'Matrix-ID'}")
-        lines.append("─" * 60)
+        lines.append(f"{'Name':<18} {'Score':>6}  {'Matrix-ID'}")
+        lines.append("─" * 50)
         for p in players:
-            gk_tag = " 🧤" if p.get("can_gk") else ""
+            gk_tag = " 🥅" if p.get("can_gk") else ""
+            score = p.get("score", p.get("score_field", 5.0))
             lines.append(
                 f"{p['display_name']:<18} "
-                f"{p.get('score_field', 5.0):>6.2f}  "
-                f"{p.get('score_gk', 5.0):>6.2f}{gk_tag:<3}  "
+                f"{score:>6.2f}{gk_tag:<3}  "
                 f"`{p['matrix_id']}`"
             )
         await self.send("\n".join(lines), room_id)
@@ -898,9 +894,7 @@ class TeamBot:
             "id":           f"guest_{name.lower().replace(' ','_')}",
             "matrix_id":    None,
             "display_name": name,
-            "score_field":  score,
-            "score_gk":     score,
-            "score_base":   score,
+            "score":        score,
             "can_gk":       False,
             "is_guest":     True,
             "active":       1,
@@ -1061,9 +1055,8 @@ class TeamBot:
 
         await self.db.save_match(score1, score2, ids1, ids2, gk1_id, gk2_id)
 
-        gk_ids    = [i for i in [gk1_id, gk2_id] if i]
         score_ids = [i for i in (ids1 + ids2) if i not in self._switched]
-        await self.db.recalculate_scores(score_ids, gk_ids=gk_ids)
+        await self.db.recalculate_scores(score_ids)
 
         # Ergebnis-Zeile
         if score1 > score2:
@@ -1733,8 +1726,8 @@ class TeamBot:
                 "id":           f"guest_{sender}_{i}_{len(self._guests)}",
                 "matrix_id":    sender,
                 "display_name": name,
-                "score_field":  5.0,
-                "score_gk":     5.0,
+                "score":        5.0,
+                
                 "can_gk":       False,
                 "is_guest":     True,
             }
