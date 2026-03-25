@@ -39,8 +39,8 @@ Reaktionen auf den **Vote-Poll** (samstags gepostet):
 
 | Reaktion | Aktion |
 |---|---|
-| ✅ | Zusage – ich spiele mit |
-| ❌ | Absage |
+| Poll-Antwort „✅ Dabei" | Zusage – im Poll-UI antippen/anklicken |
+| Poll-Antwort „❌ Nicht dabei" | Absage – im Poll-UI antippen/anklicken |
 | 🥅 | Als Torwart melden (auch ohne GK-Flag) |
 | 1️⃣–9️⃣ | N Gäste hinzufügen (z.B. 2️⃣ → „[User]s Gast 1", „[User]s Gast 2") |
 
@@ -202,9 +202,9 @@ Gäste erhalten keinen Score-Update – ihr temporärer Score (5.0) fließt nur 
 
 ```
 Samstag 12:00  →  Bot postet Poll „Kicken Sonntag, DD.MM.YYYY um 10:00"
-                   ✅ / ❌ abstimmen
-                   🥅 = als Torwart melden
-                   1️⃣–9️⃣ = Gäste hinzufügen
+                   Im Poll „✅ Dabei" / „❌ Nicht dabei" antippen
+                   🥅 = als Torwart melden (Emoji-Reaktion auf den Poll)
+                   1️⃣–9️⃣ = Gäste hinzufügen (Emoji-Reaktion auf den Poll)
 
 Sonntag 09:00  →  Bot generiert automatisch Vorschlag A
                    → Admin-Team-Poll erscheint in Admin-Gruppe
