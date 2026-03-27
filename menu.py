@@ -95,9 +95,25 @@ def player_select_poll(players: list, action_label: str) -> dict:
     return make_poll(f"👤 Spieler auswählen – {action_label}", _with_back(answers))
 
 
-def room_members_poll(members: list) -> dict:
-    answers = [(f"rm_{i}", f"{name} ({mid})") for i, (mid, name, _) in enumerate(members)]
-    return make_poll("➕ Wen hinzufügen?", _with_back(answers), max_selections=len(answers) + 1)
+def room_members_poll(members: list, page: int = 0) -> dict:
+    """Poll mit Raum-Mitgliedern, max 16 pro Seite + Navigation. Matrix-Limit: 20 Antworten."""
+    PAGE_SIZE = 16
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_members = members[start:end]
+    answers = [(f"rm_{start + i}", name) for i, (_, name, _) in enumerate(page_members)]
+    nav = []
+    if page > 0:
+        nav.append((f"page_{page - 1}", "⬅️ Vorherige Seite"))
+    if end < len(members):
+        nav.append((f"page_{page + 1}", "➡️ Nächste Seite"))
+    nav.append(("back", "↩️ Abbrechen"))
+    total = len(members)
+    title = (
+        f"➕ Wen hinzufügen? (Seite {page + 1}/{(total - 1) // PAGE_SIZE + 1})"
+        if total > PAGE_SIZE else "➕ Wen hinzufügen?"
+    )
+    return make_poll(title, answers + nav)
 
 
 def score_poll() -> dict:
