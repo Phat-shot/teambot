@@ -1340,10 +1340,11 @@ class TeamBot:
                 known_ids    = active_ids | {p["matrix_id"] for p in inactive}
                 members = []
                 try:
-                    from nio import RoomMembersResponse
+                    from nio import JoinedMembersResponse
                     resp = await scan_client.joined_members(self.config.room_id)
-                    if isinstance(resp, RoomMembersResponse):
-                        for mid, member in resp.members.items():
+                    if isinstance(resp, JoinedMembersResponse):
+                        for member in resp.members:
+                            mid = member.user_id
                             if mid in known_ids or mid == self.config.user_id:
                                 continue
                             if self.config.poll_sender_id and mid == self.config.poll_sender_id:
