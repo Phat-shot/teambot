@@ -1316,7 +1316,10 @@ class TeamBot:
                 # Hauptraum scannen (nicht Admin-Raum)
                 room_obj = self.client.rooms.get(self.config.room_id)
                 all_players = await self.db.get_all_players(active_only=False)
-                known_ids = {p["matrix_id"] for p in all_players}
+                active_ids   = {p["matrix_id"] for p in all_players if p["active"]}
+                inactive     = [p for p in all_players if not p["active"]]
+                inactive_ids = {p["matrix_id"] for p in inactive}
+                known_ids    = active_ids | inactive_ids
                 members = []
                 if room_obj:
                     for mid, user in room_obj.users.items():
@@ -1324,10 +1327,15 @@ class TeamBot:
                             if self.config.poll_sender_id and mid == self.config.poll_sender_id:
                                 continue
                             name = user.display_name or mid.split(":")[0].lstrip("@")
-                            members.append((mid, name))
+                            members.append((mid, name, False))  # (id, name, is_inactive)
+                # Deaktivierte Spieler ganz unten
+                for p in inactive:
+                    members.append((p["matrix_id"], f"↩️ {p['display_name']} (reaktivieren)", True))
                 if members:
                     state._members = members  # type: ignore
-                    pid = await self._post_poll(room_id, room_members_poll(members))
+                    answers = [(f"rm_{i}", name) for i, (_, name, _) in enumerate(members)]
+                    from poll import make_poll as _mp
+                    pid = await self._post_poll(room_id, _mp("➕ Wen hinzufügen / reaktivieren?", answers, max_selections=len(answers)))
                     if pid: state.poll_event_ids.append(pid)
                 else:
                     await self.send("✅ Alle Raum-Mitglieder sind bereits angelegt.", room_id)
@@ -1360,10 +1368,16 @@ class TeamBot:
             idx = int(answer[3:])
             members = getattr(state, "_members", [])
             if idx < len(members):
-                mid, name = members[idx]
-                await self.db.add_player(mid, name)
-                await self.db.update_score(mid, 5.0)
-                await self.send(f"✅ **{name}** (`{mid}`) hinzugefügt (Score: 5.0).", room_id)
+                mid, name, is_inactive = members[idx]
+                if is_inactive:
+                    await self.db._db.execute("UPDATE players SET active = 1 WHERE matrix_id = ?", (mid,))
+                    await self.db._db.commit()
+                    display = name.replace("↩️ ", "").replace(" (reaktivieren)", "")
+                    await self.send(f"✅ **{display}** reaktiviert.", room_id)
+                else:
+                    await self.db.add_player(mid, name)
+                    await self.db.update_score(mid, 5.0)
+                    await self.send(f"✅ **{name}** (`{mid}`) hinzugefügt (Score: 5.0).", room_id)
             self._menu.clear(room_id)
 
         elif state.command == "player_edit_select" and answer.startswith("ps_"):
@@ -1530,11 +1544,15 @@ class TeamBot:
             await self._redact(room_id, state.prompt_msg_id)
 
     async def _redact(self, room_id: str, event_id: str):
-        """Matrix-Nachricht löschen (redact)."""
-        try:
-            await self.client.room_redact(room_id, event_id, reason="Menü-Auswahl")
-        except Exception as exc:
-            logger.warning("Redact fehlgeschlagen %s: %s", event_id, exc)
+        """Matrix-Nachricht löschen. Versucht erst poll_client (für Polls), dann Bot."""
+        for client in filter(None, [self.poll_client, self.client]):
+            try:
+                resp = await client.room_redact(room_id, event_id, reason="Menü-Auswahl")
+                if not isinstance(resp, Exception):
+                    return
+            except Exception:
+                pass
+        logger.warning("Redact fehlgeschlagen für %s", event_id)
 
     async def _post_poll(self, room_id: str, content: dict) -> Optional[str]:
         """Poll posten – über poll_client falls konfiguriert, sonst Bot."""
