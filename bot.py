@@ -45,7 +45,10 @@ from nio import (
 
 from config import Config
 from db import Database
-from menu import MenuManager, category_poll_content, command_poll_content, parse_category_answer, parse_command_answer
+from menu import (MenuManager, MenuState,
+                  main_menu_poll, player_menu_poll, player_select_poll,
+                  room_members_poll, score_poll,
+                  matchday_menu_poll, team_menu_poll)
 from poll import make_poll, POLL_EVENT_TYPE, POLL_RESPONSE_TYPES, POLL_RESPONSE_KEYS
 from teams import build_teams, format_teams, format_teams_main, effective_score, TEAM1_NAME, TEAM2_NAME
 
@@ -1270,155 +1273,218 @@ class TeamBot:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _menu_start(self, room_id: str, sender: str):
-        """!cmd → Kategorie-Poll posten."""
-        # Alten State aufräumen
         old = self._menu.get(room_id)
         if old:
             await self._menu_redact_all(room_id, old)
-
         state = self._menu.start(room_id, sender)
-        poll_id = await self._post_poll(room_id, category_poll_content())
+        poll_id = await self._post_poll(room_id, main_menu_poll())
         if poll_id:
             state.poll_event_ids.append(poll_id)
 
-    async def _menu_handle_vote(self, room_id: str, state, poll_event_id: str, answers: list):
-        """Poll-Antwort verarbeiten."""
+    async def _menu_handle_vote(self, room_id: str, state: MenuState, poll_event_id: str, answers: list):
         if not answers:
             return
         answer = answers[0]
+        await self._redact(room_id, poll_event_id)
+        state.poll_event_ids = [e for e in state.poll_event_ids if e != poll_event_id]
 
+        # ── Level 1: Hauptkategorie ───────────────────────────────────────
         if state.level == 1:
-            # Kategorie gewählt
-            cat = parse_category_answer(answer)
-            if not cat:
-                return
-            state.category = cat
-            state.level = 2
+            if answer == "cat_player":
+                state.category = "player"
+                state.level = 2
+                pid = await self._post_poll(room_id, player_menu_poll())
+                if pid: state.poll_event_ids.append(pid)
 
-            # Kategorie-Poll löschen
-            await self._redact(room_id, poll_event_id)
+            elif answer == "cat_matchday":
+                state.category = "matchday"
+                state.level = 2
+                vote = await self.db.get_open_vote()
+                pid = await self._post_poll(room_id, matchday_menu_poll(bool(vote)))
+                if pid: state.poll_event_ids.append(pid)
 
-            # Command-Poll posten
-            poll_id = await self._post_poll(room_id, command_poll_content(cat))
-            if poll_id:
-                state.poll_event_ids.append(poll_id)
+            elif answer == "cat_team":
+                state.category = "team"
+                state.level = 2
+                pid = await self._post_poll(room_id, team_menu_poll())
+                if pid: state.poll_event_ids.append(pid)
 
-        elif state.level == 2:
-            # Command gewählt
-            from menu import parse_command_answer
-            item = parse_command_answer(state.category, answer)
-            if not item:
-                return
-            state.command = item.cmd
+        # ── Level 2: Spieler-Untermenü ────────────────────────────────────
+        elif state.category == "player" and state.level == 2:
+            if answer == "pl_add":
+                state.command = "player_add"
+                # Raum-Mitglieder holen die noch nicht registriert sind
+                room_obj = self.client.rooms.get(room_id)
+                all_players = await self.db.get_all_players(active_only=False)
+                known_ids = {p["matrix_id"] for p in all_players}
+                members = []
+                if room_obj:
+                    for mid, user in room_obj.users.items():
+                        if mid not in known_ids and mid != self.config.user_id:
+                            if self.config.poll_sender_id and mid == self.config.poll_sender_id:
+                                continue
+                            name = user.display_name or mid.split(":")[0].lstrip("@")
+                            members.append((mid, name))
+                if members:
+                    state.level = 2
+                    state._members = members  # type: ignore
+                    pid = await self._post_poll(room_id, room_members_poll(members))
+                    if pid: state.poll_event_ids.append(pid)
+                    state.command = "player_add_select"
+                else:
+                    await self.send("✅ Alle Raum-Mitglieder sind bereits angelegt.", room_id)
+                    self._menu.clear(room_id)
 
-            # Command-Poll löschen
-            await self._redact(room_id, poll_event_id)
+            elif answer == "pl_edit":
+                state.command = "player_edit_select"
+                players = await self.db.get_all_players()
+                if not players:
+                    await self.send("⚠️ Keine Spieler angelegt.", room_id)
+                    self._menu.clear(room_id)
+                    return
+                state._players = players  # type: ignore
+                state.level = 2
+                pid = await self._post_poll(room_id, player_select_poll(players, "Score ändern"))
+                if pid: state.poll_event_ids.append(pid)
 
-            if item.prompt:
-                # Freitext nötig
-                state.level = 3
-                hint = f"\n_{item.hint}_" if item.hint else ""
-                prompt_id = await self.send(
-                    f"✏️ **{item.label}**\n{item.prompt}{hint}", room_id
-                )
-                state.prompt_msg_id = prompt_id
+            elif answer == "pl_del":
+                state.command = "player_del_select"
+                players = await self.db.get_all_players()
+                if not players:
+                    await self.send("⚠️ Keine Spieler angelegt.", room_id)
+                    self._menu.clear(room_id)
+                    return
+                state._players = players  # type: ignore
+                state.level = 2
+                pid = await self._post_poll(room_id, player_select_poll(players, "Löschen"))
+                if pid: state.poll_event_ids.append(pid)
+
+        # ── Level 2: Spieler-Select-Flows ─────────────────────────────────
+        elif state.command == "player_add_select" and answer.startswith("rm_"):
+            idx = int(answer[3:])
+            members = getattr(state, "_members", [])
+            if idx < len(members):
+                mid, name = members[idx]
+                await self.db.add_player(mid, name)
+                await self.db.update_score(mid, 5.0)
+                await self.send(f"✅ **{name}** (`{mid}`) hinzugefügt (Score: 5.0).", room_id)
+            self._menu.clear(room_id)
+
+        elif state.command == "player_edit_select" and answer.startswith("ps_"):
+            player_id = int(answer[3:])
+            players = getattr(state, "_players", [])
+            p = next((x for x in players if x["id"] == player_id), None)
+            if p:
+                state.selected_matrix_id = p["matrix_id"]
+                state.command = "player_set_score"
+                state.level = 2
+                pid = await self._post_poll(room_id, score_poll())
+                if pid: state.poll_event_ids.append(pid)
+                await self.send(f"📊 Score für **{p['display_name']}** wählen:", room_id)
             else:
-                # Direkt ausführen
-                await self._menu_execute(room_id, state, "")
+                self._menu.clear(room_id)
+
+        elif state.command == "player_set_score" and answer.startswith("sc_"):
+            score = int(answer[3:]) / 10.0
+            mid = state.selected_matrix_id
+            if mid:
+                p = await self.db.get_player(mid)
+                await self.db.update_score(mid, score)
+                name = p["display_name"] if p else mid
+                await self.send(f"✅ **{name}** – Score: **{score:.1f}**", room_id)
+            self._menu.clear(room_id)
+
+        elif state.command == "player_del_select" and answer.startswith("ps_"):
+            player_id = int(answer[3:])
+            players = getattr(state, "_players", [])
+            p = next((x for x in players if x["id"] == player_id), None)
+            if p:
+                await self.db.deactivate_player(p["matrix_id"])
+                await self.send(f"✅ **{p['display_name']}** deaktiviert.", room_id)
+            self._menu.clear(room_id)
+
+        # ── Level 2: Matchday-Untermenü ───────────────────────────────────
+        elif state.category == "matchday" and state.level == 2:
+            if answer == "md_vote":
+                await self._scheduled_vote()
+                self._menu.clear(room_id)
+            elif answer == "md_team":
+                await self._cmd_team(room_id=room_id)
+                self._menu.clear(room_id)
+            elif answer == "md_result":
+                state.command = "result"
+                state.level = 3
+                pid = await self.send("✏️ **Ergebnis eintragen**\nFormat: `3:2`", room_id)
+                state.prompt_msg_id = pid
+
+        # ── Level 2: Team-Untermenü ───────────────────────────────────────
+        elif state.category == "team" and state.level == 2:
+            if answer == "tm_next":
+                await self._cmd_team(room_id=room_id)
+                self._menu.clear(room_id)
+            elif answer == "tm_alt":
+                await self._cmd_team(room_id=room_id)
+                self._menu.clear(room_id)
+            elif answer == "tm_select":
+                state.command = "team_select"
+                state.level = 3
+                avail = ", ".join(sorted(self._proposals.keys())) or "–"
+                pid = await self.send(f"✏️ **Vorschlag aktivieren**\nVerfügbar: {avail}\nBuchstabe eingeben:", room_id)
+                state.prompt_msg_id = pid
+            elif answer == "tm_guest":
+                state.command = "match_guest"
+                state.level = 3
+                pid = await self.send('✏️ **Gastspieler hinzufügen**\nFormat: `"Name"` oder `"Name" 7.5`', room_id)
+                state.prompt_msg_id = pid
+            elif answer == "tm_change":
+                state.command = "match_change"
+                state.level = 3
+                pid = await self.send("✏️ **Spieler tauschen**\nEin oder zwei Namen:", room_id)
+                state.prompt_msg_id = pid
+            elif answer == "tm_gk":
+                state.command = "match_setgk"
+                state.level = 3
+                pid = await self.send("✏️ **Torwart setzen**\nName eingeben:", room_id)
+                state.prompt_msg_id = pid
+            elif answer == "tm_switch":
+                state.command = "match_switched"
+                state.level = 3
+                pid = await self.send("✏️ **Spieler nicht werten**\nName eingeben:", room_id)
+                state.prompt_msg_id = pid
+            elif answer == "tm_announce":
+                if self._has_teams():
+                    if self._last_team_msg_id:
+                        await self._redact(self.config.room_id, self._last_team_msg_id)
+                    self._last_team_msg_id = await self.send_main(self._current_teams_text_main())
+                    await self.send("✅ Team angekündigt.", room_id)
+                else:
+                    await self.send("⚠️ Kein Team aktiv.", room_id)
                 self._menu.clear(room_id)
 
     async def _menu_handle_text(self, room_id: str, text: str, sender: str):
-        """Freitext-Eingabe nach Poll-Auswahl verarbeiten."""
         state = self._menu.get(room_id)
         if not state or state.level != 3:
             return
-
-        # Prompt-Nachricht löschen
         if state.prompt_msg_id:
             await self._redact(room_id, state.prompt_msg_id)
-
-        await self._menu_execute(room_id, state, text.strip())
-        self._menu.clear(room_id)
-
-    async def _menu_execute(self, room_id: str, state, text: str):
-        """Command ausführen basierend auf Auswahl und Freitext."""
         cmd = state.command
-
         try:
-            match cmd:
-                # ── Spieler ──────────────────────────────────────────────
-                case "player_add":
-                    await self._menu_player_add(room_id, text, state.user)
-
-                case "player_set_field":
-                    parts = text.split()
-                    if len(parts) < 2:
-                        return await self.send("❌ Format: `Name Score`", room_id)
-                    score_str = parts[-1]
-                    name = " ".join(parts[:-1])
-                    await self._handle_player(["set", name, "field", score_str], state.user, room_id)
-
-                case "player_set_gk":
-                    parts = text.split()
-                    if len(parts) < 2:
-                        return await self.send("❌ Format: `Name Score`", room_id)
-                    score_str = parts[-1]
-                    name = " ".join(parts[:-1])
-                    await self._handle_player(["set", name, "gk", score_str], state.user, room_id)
-
-                case "player_toggle_gk":
-                    await self._handle_player(["gk", text], state.user, room_id)
-
-                case "player_del":
-                    await self._handle_player(["del", text], state.user, room_id)
-
-                # ── Spieltag ─────────────────────────────────────────────
-                case "team_next":
-                    await self._cmd_team(room_id=room_id)
-
-                case "team_alt":
-                    await self._cmd_team(room_id=room_id)
-
-                case "team_select":
-                    letter = text.strip().upper()
-                    await self._cmd_team(select_letter=letter, room_id=room_id)
-
-                case "team_vote":
-                    await self._cmd_team(post_vote=True, room_id=room_id)
-
-                case "match_guest":
-                    args = text.split()
-                    await self._match_guest(args, room_id=room_id)
-
-                case "match_change":
-                    args = text.split()
-                    await self._match_change(args, room_id=room_id)
-
-                case "match_setgk":
-                    await self._match_setgk([text], room_id=room_id)
-
-                case "match_switched":
-                    await self._match_switched([text], room_id=room_id)
-
-                case "result":
-                    await self._handle_result([text], state.user, room_id)
-
-                case "vote":
-                    await self._scheduled_vote()
-
-                # ── Auswertung ───────────────────────────────────────────
-                case "player_list":
-                    await self._player_list(room_id=room_id)
-
-                case "match_history":
-                    await self._match_history(5, room_id=room_id)
-
-                case "scores":
-                    await self._player_list(room_id=room_id)
-
+            if cmd == "result":
+                await self._handle_result([text.strip()], state.user, room_id)
+            elif cmd == "team_select":
+                await self._cmd_team(select_letter=text.strip().upper(), room_id=room_id)
+            elif cmd == "match_guest":
+                await self._match_guest(text.split(), room_id=room_id)
+            elif cmd == "match_change":
+                await self._match_change(text.split(), room_id=room_id)
+            elif cmd == "match_setgk":
+                await self._match_setgk([text.strip()], room_id=room_id)
+            elif cmd == "match_switched":
+                await self._match_switched([text.strip()], room_id=room_id)
         except Exception as exc:
-            logger.exception("Menü-Fehler bei cmd=%s", cmd)
+            logger.exception("Menü-Fehler cmd=%s", cmd)
             await self.send(f"❌ Fehler: {exc}", room_id)
+        self._menu.clear(room_id)
 
     async def _menu_player_add(self, room_id: str, text: str, sender: str):
         """

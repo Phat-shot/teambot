@@ -1,82 +1,28 @@
 """
 Interaktives Admin-Menü via Matrix-Polls.
 
-Ablauf:
-  !cmd              → Level-1 Poll (Kategorien)
-  Nutzer wählt      → Level-2 Poll (Commands der Kategorie)
-  Nutzer wählt      → Ausführung ODER Freitext-Prompt
-  Nächste Nachricht → Ausführung mit Freitext-Input
+Struktur:
+  Level 1: Hauptkategorien – 1. Spieler  2. Matchday  3. Team
+  Level 2: Unterpunkte je Kategorie (teils als Poll mit Raumnutzern)
+  Level 3: Freitext oder Score-Poll
 
-Polls werden nach Auswahl redacted (gelöscht).
+Alle Polls werden nach Auswahl gelöscht.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 from poll import make_poll
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Menü-Struktur
+# Kategorien (Level 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class MenuItem:
-    label: str          # Anzeige im Poll
-    cmd:   str          # Interner Command-Key
-    prompt: str = ""    # Freitext-Prompt (leer = kein Input nötig)
-    hint: str = ""      # Kurzer Hinweis nach dem Prompt
-
-
-# Kategorien → Commands
-MENU: Dict[str, List[MenuItem]] = {
-    "👤 Spieler": [
-        MenuItem("➕ Spieler hinzufügen",         "player_add",
-                 "Matrix-ID oder Name eingeben:",
-                 "z.B. @max:server  oder  Max  (Name wird aus Matrix-Profil gelesen)"),
-        MenuItem("📊 Feldspieler-Score setzen",   "player_set_field",
-                 "Name und Score eingeben:",
-                 "z.B.  Max 7.5"),
-        MenuItem("🧤 Torwart-Score setzen",        "player_set_gk",
-                 "Name und Score eingeben:",
-                 "z.B.  Max 8.0"),
-        MenuItem("🔄 GK-Fähigkeit umschalten",    "player_toggle_gk",
-                 "Spieler eingeben:",
-                 "Name oder @user:server"),
-        MenuItem("❌ Spieler deaktivieren",        "player_del",
-                 "Spieler eingeben:",
-                 "Name oder @user:server"),
-    ],
-    "⚽ Spieltag": [
-        MenuItem("🎲 Team-Vorschlag generieren",   "team_next"),
-        MenuItem("🔀 Weiteren Vorschlag",          "team_alt"),
-        MenuItem("✅ Vorschlag aktivieren",        "team_select",
-                 "Vorschlag-Buchstabe eingeben:",
-                 "z.B.  A  oder  B"),
-        MenuItem("🗳️ Vorschläge zur Abstimmung",  "team_vote"),
-        MenuItem("👤 Gastspieler hinzufügen",      "match_guest",
-                 "Name und optionalen Score eingeben:",
-                 'z.B.  "Max Mustermann"  oder  "Max" 7.5'),
-        MenuItem("🔄 Spieler tauschen/verschieben","match_change",
-                 "Ein oder zwei Namen eingeben:",
-                 "z.B.  Max  oder  Max Anna"),
-        MenuItem("🧤 Torwart setzen",              "match_setgk",
-                 "Spieler eingeben:",
-                 "Name des neuen Torwarts"),
-        MenuItem("🔕 Spieler nicht werten",        "match_switched",
-                 "Spieler eingeben:",
-                 "Name des Spielers"),
-        MenuItem("📝 Ergebnis eintragen",          "result",
-                 "Ergebnis eingeben:",
-                 "z.B.  3:2"),
-        MenuItem("🗓️ Vote starten",               "vote"),
-    ],
-    "📊 Auswertung": [
-        MenuItem("👥 Spielerliste anzeigen",       "player_list"),
-        MenuItem("📋 Letzte Ergebnisse",           "match_history"),
-        MenuItem("📈 Scores anzeigen",             "scores"),
-    ],
-}
-
-CATEGORIES = list(MENU.keys())
+CATEGORIES = [
+    ("cat_player",   "👤 Spieler"),
+    ("cat_matchday", "📅 Matchday"),
+    ("cat_team",     "⚽ Team"),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,17 +31,20 @@ CATEGORIES = list(MENU.keys())
 
 @dataclass
 class MenuState:
-    user:             str            # Matrix-ID des Nutzers im Menü-Flow
-    level:            int   = 0      # 1 = Kategorie-Poll offen, 2 = Command-Poll offen, 3 = Freitext
-    category:         str   = ""
-    command:          str   = ""
-    poll_event_ids:   List[str] = field(default_factory=list)   # alle offenen Poll-IDs
-    prompt_msg_id:    Optional[str] = None  # Prompt-Nachricht (zum Löschen)
+    user:           str
+    level:          int  = 1
+    category:       str  = ""
+    command:        str  = ""
+    poll_event_ids: List[str] = field(default_factory=list)
+    prompt_msg_id:  Optional[str] = None
+    # Für Spieler-Select-Flow (Ändern/Löschen)
+    selected_matrix_id: Optional[str] = None
+    # Für Score-Poll
+    score_poll_answers: Dict[str, float] = field(default_factory=dict)
 
 
 class MenuManager:
     def __init__(self):
-        # room_id → MenuState
         self._states: Dict[str, MenuState] = {}
 
     def get(self, room_id: str) -> Optional[MenuState]:
@@ -109,9 +58,6 @@ class MenuManager:
     def clear(self, room_id: str):
         self._states.pop(room_id, None)
 
-    def is_active(self, room_id: str) -> bool:
-        return room_id in self._states
-
     def awaiting_text(self, room_id: str, user: str) -> bool:
         s = self._states.get(room_id)
         return s is not None and s.level == 3 and s.user == user
@@ -121,36 +67,74 @@ class MenuManager:
 # Poll-Content Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def category_poll_content() -> dict:
+def main_menu_poll() -> dict:
     return make_poll(
         "🤖 TeamBot – Was möchtest du tun?",
-        [(f"cat_{i}", cat) for i, cat in enumerate(CATEGORIES)],
+        CATEGORIES,
     )
 
 
-def command_poll_content(category: str) -> dict:
-    items = MENU[category]
+def player_menu_poll() -> dict:
     return make_poll(
-        f"{category} – Was genau?",
-        [(f"cmd_{i}", item.label) for i, item in enumerate(items)],
+        "👤 Spieler – Was möchtest du tun?",
+        [
+            ("pl_add",  "➕ Hinzufügen"),
+            ("pl_edit", "✏️ Score ändern"),
+            ("pl_del",  "❌ Löschen"),
+        ],
     )
 
 
-def parse_category_answer(answer_id: str) -> Optional[str]:
-    """'cat_2' → CATEGORIES[2]"""
-    if answer_id.startswith("cat_"):
-        try:
-            return CATEGORIES[int(answer_id[4:])]
-        except (ValueError, IndexError):
-            pass
-    return None
+def player_select_poll(players: list, action_label: str) -> dict:
+    """Poll mit allen registrierten Spielern zur Auswahl."""
+    answers = [(f"ps_{p['id']}", p["display_name"]) for p in players]
+    return make_poll(f"👤 Spieler auswählen – {action_label}", answers)
 
 
-def parse_command_answer(category: str, answer_id: str) -> Optional[MenuItem]:
-    """'cmd_3' → MENU[category][3]"""
-    if answer_id.startswith("cmd_"):
-        try:
-            return MENU[category][int(answer_id[4:])]
-        except (ValueError, IndexError):
-            pass
-    return None
+def room_members_poll(members: list) -> dict:
+    """Poll mit Raum-Mitgliedern die noch nicht angelegt sind."""
+    answers = [(f"rm_{i}", f"{name} ({mid})") for i, (mid, name) in enumerate(members)]
+    return make_poll("➕ Wen hinzufügen?", answers, max_selections=len(answers))
+
+
+def score_poll() -> dict:
+    """Poll mit Score-Werten 0–10 in 0.5-Schritten."""
+    scores = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
+              5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]
+    answers = [(f"sc_{int(s*10)}", str(s)) for s in scores]
+    return make_poll("📊 Score vergeben (0–10):", answers)
+
+
+def matchday_menu_poll(vote_open: bool) -> dict:
+    if vote_open:
+        return make_poll(
+            "📅 Matchday – Vote ist offen:",
+            [
+                ("md_team",   "⚽ Team erstellen"),
+                ("md_result", "📝 Ergebnis eintragen"),
+            ],
+        )
+    else:
+        return make_poll(
+            "📅 Matchday – Kein Vote offen:",
+            [
+                ("md_vote",   "🗓️ Vote starten"),
+                ("md_result", "📝 Ergebnis eintragen"),
+            ],
+        )
+
+
+def team_menu_poll() -> dict:
+    return make_poll(
+        "⚽ Team – Was möchtest du tun?",
+        [
+            ("tm_next",   "🎲 Team-Vorschlag generieren"),
+            ("tm_alt",    "🔀 Weiteren Vorschlag"),
+            ("tm_select", "✅ Vorschlag aktivieren"),
+            ("tm_guest",  "👤 Gast hinzufügen"),
+            ("tm_change", "🔄 Spieler tauschen"),
+            ("tm_gk",     "🧤 Torwart setzen"),
+            ("tm_switch", "🔕 Spieler nicht werten"),
+            ("tm_announce","📣 Team ankündigen"),
+        ],
+    )
