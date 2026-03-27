@@ -24,14 +24,15 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS players (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    matrix_id    TEXT    UNIQUE NOT NULL,
-    display_name TEXT    NOT NULL,
-    score        REAL    NOT NULL DEFAULT 5.0,
-    score_base   REAL    NOT NULL DEFAULT 5.0,
-    can_gk       INTEGER NOT NULL DEFAULT 0,
-    active       INTEGER NOT NULL DEFAULT 1,
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_number TEXT    UNIQUE,           -- interne ID 0001-9999
+    matrix_id     TEXT    UNIQUE NOT NULL,
+    display_name  TEXT    NOT NULL,
+    score         REAL    NOT NULL DEFAULT 5.0,
+    score_base    REAL    NOT NULL DEFAULT 5.0,
+    can_gk        INTEGER NOT NULL DEFAULT 0,
+    active        INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS matches (
@@ -102,14 +103,13 @@ class Database:
     async def _migrate(self):
         """Add new columns to existing DB if upgrading from old schema."""
         migrations = [
-            # Legacy: alte Spalten → neue score-Spalte
             "ALTER TABLE players ADD COLUMN score REAL NOT NULL DEFAULT 5.0",
             "ALTER TABLE players ADD COLUMN score_base REAL NOT NULL DEFAULT 5.0",
             "ALTER TABLE players ADD COLUMN can_gk INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE players ADD COLUMN player_number TEXT",
             "ALTER TABLE matches ADD COLUMN team1_gk_id INTEGER",
             "ALTER TABLE matches ADD COLUMN team2_gk_id INTEGER",
             "ALTER TABLE match_participations ADD COLUMN played_gk INTEGER NOT NULL DEFAULT 0",
-            # Falls alte score_field Spalte existiert → in score übertragen
             "UPDATE players SET score = score_field, score_base = score_base WHERE score_field IS NOT NULL AND score = 5.0",
         ]
         for sql in migrations:
@@ -117,7 +117,20 @@ class Database:
                 await self._db.execute(sql)
                 await self._db.commit()
             except Exception:
-                pass  # already exists or not applicable
+                pass
+
+        # Bestehende Spieler ohne player_number nachträglich befüllen
+        async with self._db.execute(
+            "SELECT id FROM players WHERE player_number IS NULL ORDER BY id"
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            num = await self._next_player_number()
+            await self._db.execute(
+                "UPDATE players SET player_number=? WHERE id=?", (num, row[0])
+            )
+        if rows:
+            await self._db.commit()  # already exists or not applicable
 
     async def close(self):
         if self._db:
@@ -127,13 +140,42 @@ class Database:
     # Players
     # ------------------------------------------------------------------
 
-    async def add_player(self, matrix_id: str, display_name: str, can_gk: bool = False) -> int:
+    async def _next_player_number(self) -> str:
+        """Nächste freie interne Spielernummer 0001–9999."""
         async with self._db.execute(
-            "INSERT INTO players (matrix_id, display_name, can_gk) VALUES (?,?,?)",
-            (matrix_id, display_name, int(can_gk)),
+            "SELECT player_number FROM players WHERE player_number IS NOT NULL ORDER BY player_number"
+        ) as cur:
+            rows = await cur.fetchall()
+        used = {r[0] for r in rows}
+        for i in range(1, 10000):
+            num = f"{i:04d}"
+            if num not in used:
+                return num
+        raise ValueError("Alle Spielernummern vergeben (0001–9999)")
+
+    async def add_player(self, matrix_id: str, display_name: str, can_gk: bool = False) -> int:
+        num = await self._next_player_number()
+        async with self._db.execute(
+            "INSERT INTO players (player_number, matrix_id, display_name, can_gk) VALUES (?,?,?,?)",
+            (num, matrix_id, display_name, int(can_gk)),
         ) as cur:
             await self._db.commit()
             return cur.lastrowid  # type: ignore
+
+    async def get_player_by_number(self, number: str) -> Optional[Dict]:
+        """Spieler über interne ID finden (z.B. '0042')."""
+        padded = number.zfill(4)
+        async with self._db.execute(
+            "SELECT * FROM players WHERE player_number = ?", (padded,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def rename_player(self, matrix_id: str, new_name: str):
+        await self._db.execute(
+            "UPDATE players SET display_name=? WHERE matrix_id=?", (new_name, matrix_id)
+        )
+        await self._db.commit()
 
     async def get_player(self, matrix_id: str) -> Optional[Dict]:
         async with self._db.execute(
@@ -173,6 +215,7 @@ class Database:
             return [dict(r) for r in rows]
 
     async def update_score(self, matrix_id: str, score: float):
+        """Manuell gesetzter Basis-Score (Admin). Wird nie durch Match-Ergebnisse überschrieben."""
         s = round(min(10.0, max(0.0, score)), 2)
         await self._db.execute(
             "UPDATE players SET score=?, score_base=? WHERE matrix_id=?",
@@ -283,7 +326,16 @@ class Database:
         team2_ids: List[int],
         team1_gk_id: Optional[int] = None,
         team2_gk_id: Optional[int] = None,
+        team1_avg: float = 5.0,
+        team2_avg: float = 5.0,
+        K: float = 0.3,
     ) -> int:
+        """
+        Speichert ein Match. Match-Score per Elo-Erwartungskorrektur:
+          match_score = clamp(basis + K × (ergebnis − erwartung) × 10)
+          ergebnis: Sieg=1, Unentschieden=0.5, Niederlage=0
+          erwartung: 1 / (1 + 10^((Ø_gegner − Ø_team) / 4))
+        """
         async with self._db.execute(
             """INSERT INTO matches
                (team1_score, team2_score, team1_player_ids, team2_player_ids,
@@ -295,11 +347,21 @@ class Database:
         ) as cur:
             match_id = cur.lastrowid
 
+        won1  = team1_score > team2_score
+        won2  = team2_score > team1_score
+        draw  = team1_score == team2_score
+        act1  = 1.0 if won1 else (0.5 if draw else 0.0)
+        act2  = 1.0 if won2 else (0.5 if draw else 0.0)
+        exp1  = 1.0 / (1.0 + 10 ** ((team2_avg - team1_avg) / 4.0))
+        exp2  = 1.0 - exp1
         goal_diff_t1 =  team1_score - team2_score
         goal_diff_t2 = -goal_diff_t1
 
         for pid in team1_ids:
-            ms = _goal_diff_to_score(goal_diff_t1)
+            base = await self._scalar(
+                "SELECT score_base FROM players WHERE id=?", (pid,), default=5.0
+            )
+            ms = round(min(10.0, max(0.0, base + K * (act1 - exp1) * 10)), 3)
             await self._db.execute(
                 """INSERT INTO match_participations
                    (match_id, player_id, team, played_gk, goal_diff, match_score)
@@ -307,7 +369,10 @@ class Database:
                 (match_id, pid, int(pid == team1_gk_id), goal_diff_t1, ms),
             )
         for pid in team2_ids:
-            ms = _goal_diff_to_score(goal_diff_t2)
+            base = await self._scalar(
+                "SELECT score_base FROM players WHERE id=?", (pid,), default=5.0
+            )
+            ms = round(min(10.0, max(0.0, base + K * (act2 - exp2) * 10)), 3)
             await self._db.execute(
                 """INSERT INTO match_participations
                    (match_id, player_id, team, played_gk, goal_diff, match_score)
@@ -320,10 +385,13 @@ class Database:
 
     async def recalculate_scores(self, player_ids: List[int], **kwargs):
         """
-        Score-Neuberechnung (ein Score pro Spieler):
-          50 % score_base  (= letzter berechneter Wert)
-          30 % Ø letzte 5 Spiele
-          20 % letztes Spiel
+        Score-Neuberechnung:
+          score = 50% score_base (manuell, nie überschrieben)
+                + 25% Ø gesamte History (ohne letzte 3 Spiele)
+                + 25% Ø letzte 3 Spiele
+
+        score_base wird NIE durch Match-Ergebnisse geändert –
+        nur durch expliziten Admin-Befehl (!player set).
         """
         for pid in player_ids:
             async with self._db.execute(
@@ -332,28 +400,37 @@ class Database:
                 row = await cur.fetchone()
                 base = float(row[0]) if row else 5.0
 
-            last5 = await self._scalar(
-                """SELECT AVG(match_score) FROM (
-                     SELECT mp.match_score FROM match_participations mp
-                     JOIN matches m ON mp.match_id = m.id
-                     WHERE mp.player_id=?
-                     ORDER BY m.played_at DESC LIMIT 5
-                   )""",
-                (pid,), default=base,
-            )
-            last1 = await self._scalar(
+            # Alle Match-Scores chronologisch
+            async with self._db.execute(
                 """SELECT mp.match_score FROM match_participations mp
                    JOIN matches m ON mp.match_id = m.id
-                   WHERE mp.player_id=?
-                   ORDER BY m.played_at DESC LIMIT 1""",
-                (pid,), default=base,
-            )
+                   WHERE mp.player_id = ?
+                   ORDER BY m.played_at ASC""",
+                (pid,)
+            ) as cur:
+                rows = await cur.fetchall()
+            all_scores = [float(r[0]) for r in rows]
+
+            if not all_scores:
+                # Noch keine Spiele → Score bleibt Basis
+                continue
+
+            last3  = all_scores[-3:]
+            rest   = all_scores[:-3] if len(all_scores) > 3 else []
+
+            avg_last3 = sum(last3) / len(last3)
+            avg_rest  = sum(rest) / len(rest) if rest else base
+
             new_score = round(
-                min(10.0, max(0.0, base * 0.50 + last5 * 0.30 + last1 * 0.20)), 2
+                min(10.0, max(0.0,
+                    base * 0.50 + avg_rest * 0.25 + avg_last3 * 0.25
+                )), 2
             )
+
+            # score wird aktualisiert, score_base NICHT
             await self._db.execute(
-                "UPDATE players SET score=?, score_base=? WHERE id=?",
-                (new_score, new_score, pid),
+                "UPDATE players SET score=? WHERE id=?",
+                (new_score, pid),
             )
 
         await self._db.commit()
