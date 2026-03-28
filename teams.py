@@ -101,7 +101,77 @@ def build_teams(
 ) -> Tuple[List[Dict], Optional[Dict], List[Dict], Optional[Dict]]:
     gk1, gk2, field = assign_gks(players, gk_volunteers)
     t1_field, t2_field = balance_field_players(field)
+    t1_field, t2_field = _match_guests_to_hosts(t1_field, t2_field, gk1, gk2)
     return t1_field, gk1, t2_field, gk2
+
+
+def _match_guests_to_hosts(
+    t1_field: List[Dict],
+    t2_field: List[Dict],
+    gk1: Optional[Dict],
+    gk2: Optional[Dict],
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Versucht Gäste ins gleiche Team wie ihren Mitbringer zu verschieben.
+    Tauscht den Gast mit dem ähnlichsten Feldspieler des anderen Teams.
+    GKs werden nicht getauscht.
+    """
+    # Alle Spieler inkl. GKs für Host-Suche
+    t1_all_ids = {p.get("matrix_id") for p in t1_field} | ({gk1.get("matrix_id")} if gk1 else set())
+    t2_all_ids = {p.get("matrix_id") for p in t2_field} | ({gk2.get("matrix_id")} if gk2 else set())
+
+    for _ in range(10):  # max Iterationen um Endlosschleifen zu vermeiden
+        swapped = False
+        for guest in list(t1_field):
+            if not guest.get("is_guest"):
+                continue
+            host_id = guest.get("matrix_id")
+            if not host_id:
+                continue
+            # Host in t2 → Gast sollte auch in t2 sein
+            if host_id in t2_all_ids:
+                # Ähnlichsten Feldspieler in t2 finden (nicht-Gast bevorzugt)
+                candidates = [p for p in t2_field if p != guest]
+                if not candidates:
+                    continue
+                non_guest_cands = [p for p in candidates if not p.get("is_guest")]
+                pool = non_guest_cands if non_guest_cands else candidates
+                swap = min(pool, key=lambda p: abs(effective_score(p) - effective_score(guest)))
+                t1_field.remove(guest)
+                t2_field.remove(swap)
+                t1_field.append(swap)
+                t2_field.append(guest)
+                t1_all_ids = {p.get("matrix_id") for p in t1_field} | ({gk1.get("matrix_id")} if gk1 else set())
+                t2_all_ids = {p.get("matrix_id") for p in t2_field} | ({gk2.get("matrix_id")} if gk2 else set())
+                swapped = True
+                break
+
+        for guest in list(t2_field):
+            if not guest.get("is_guest"):
+                continue
+            host_id = guest.get("matrix_id")
+            if not host_id:
+                continue
+            if host_id in t1_all_ids:
+                candidates = [p for p in t1_field if p != guest]
+                if not candidates:
+                    continue
+                non_guest_cands = [p for p in candidates if not p.get("is_guest")]
+                pool = non_guest_cands if non_guest_cands else candidates
+                swap = min(pool, key=lambda p: abs(effective_score(p) - effective_score(guest)))
+                t2_field.remove(guest)
+                t1_field.remove(swap)
+                t2_field.append(swap)
+                t1_field.append(guest)
+                t1_all_ids = {p.get("matrix_id") for p in t1_field} | ({gk1.get("matrix_id")} if gk1 else set())
+                t2_all_ids = {p.get("matrix_id") for p in t2_field} | ({gk2.get("matrix_id")} if gk2 else set())
+                swapped = True
+                break
+
+        if not swapped:
+            break
+
+    return t1_field, t2_field
 
 
 def format_teams(
