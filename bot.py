@@ -173,22 +173,36 @@ class TeamBot:
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
         self.client.add_response_callback(self._on_sync, SyncResponse)
 
+        # poll_client empfängt Events aus dem Hauptraum (Teambot ist dort evtl. nicht Mitglied)
+        if self.poll_client:
+            self.poll_client.add_event_callback(self._on_reaction, UnknownEvent)
+            self.poll_client.add_event_callback(self._on_reaction, ReactionEvent)
+            self.poll_client.add_event_callback(self._on_message, RoomMessageText)
+            self.poll_client.add_response_callback(self._on_poll_sync, SyncResponse)
+
         self._setup_scheduler()
         self.scheduler.start()
 
         # Sync-Token laden – Bot setzt nach Neustart genau hier fort
         since = _load_sync_token()
+        since_poll = _load_sync_token("data/sync_token_poll")
         if since:
             logger.info("Sync-Token geladen – überspringe bereits verarbeitete Events")
         else:
             logger.info("Kein Sync-Token – erster Start, verarbeite nur neue Events")
 
         logger.info("Bot läuft – Sync-Loop startet …")
-        await self.client.sync_forever(
-            timeout=30_000,
-            full_state=True,
-            since=since,
-        )
+
+        import asyncio as _asyncio
+        tasks = [
+            self.client.sync_forever(timeout=30_000, full_state=True, since=since),
+        ]
+        if self.poll_client:
+            async def _poll_sync():
+                await self.poll_client.sync_forever(timeout=30_000, full_state=True, since=since_poll,
+                                                     sync_filter={"room": {"timeline": {"limit": 100}}})
+            tasks.append(_poll_sync())
+        await _asyncio.gather(*tasks)
 
     def _setup_scheduler(self):
         cfg = self.config
@@ -308,6 +322,10 @@ class TeamBot:
         """Sync-Token nach jedem erfolgreichen Sync persistieren."""
         _save_sync_token(response.next_batch)
 
+    async def _on_poll_sync(self, response):
+        """Sync-Token für poll_client persistieren."""
+        _save_sync_token(response.next_batch, "data/sync_token_poll")
+
     async def _on_message(self, room, event):
         if event.sender == self.config.user_id:
             return
@@ -367,10 +385,12 @@ class TeamBot:
                     else:
                         await self._cmd_team(room_id=room_id)
                 case "!vote":
-                    if self._is_admin(event.sender):
-                        await self._scheduled_vote()
+                    if not self._is_admin(event.sender):
+                        return await self.send("❌ Keine Berechtigung.", room_id)
+                    if args and args[0] == "status":
+                        await self._vote_status(room_id)
                     else:
-                        await self.send("❌ Keine Berechtigung.", room_id)
+                        await self._scheduled_vote()
                 case "!help":
                     await self.send(HELP_TEXT, room_id)
         except Exception as exc:
@@ -421,6 +441,11 @@ class TeamBot:
                 player = await self.db.get_player(event.sender)
                 name = player["display_name"] if player else event.sender
                 await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.admin_room_id or self.config.room_id)
+            elif key == "🩹":
+                await self.db.add_injured_request(vote["id"], event.sender)
+                player = await self.db.get_player(event.sender)
+                name = player["display_name"] if player else event.sender
+                await self.send(f"🩹 **{name}** spielt angeschlagen (−2 Matchday-Score).", self.config.admin_room_id or self.config.room_id)
             elif key == self.config.vote_yes:
                 await self.db.upsert_vote_response(vote["id"], event.sender, "yes")
                 await self._handle_yes_voter(event.sender)
@@ -533,12 +558,20 @@ class TeamBot:
             await self._add_reaction_guests(event.sender, sender_display, count)
             return
 
-        # 🥅 → Als Torwart für diesen Spieltag melden (auch ohne can_gk Flag)
+        # 🥅 → Als Torwart für diesen Spieltag melden
         if key == "🥅":
             await self.db.add_gk_request(vote["id"], event.sender)
             player = await self.db.get_player(event.sender)
             name = player["display_name"] if player else event.sender
             await self.send(f"🥅 **{name}** steht als Torwart zur Verfügung!", self.config.admin_room_id or self.config.room_id)
+            return
+
+        # 🩹 → Angeschlagen melden
+        if key == "🩹":
+            await self.db.add_injured_request(vote["id"], event.sender)
+            player = await self.db.get_player(event.sender)
+            name = player["display_name"] if player else event.sender
+            await self.send(f"🩹 **{name}** spielt angeschlagen (−2 Matchday-Score).", self.config.admin_room_id or self.config.room_id)
             return
 
         if key == self.config.vote_yes:
@@ -801,6 +834,24 @@ class TeamBot:
         old_name = p["display_name"]
         await self.db.rename_player(p["matrix_id"], new_name)
         await self.send(f"✅ **{old_name}** → **{new_name}** (`#{p['player_number']}`)", room_id)
+
+    async def _vote_status(self, room_id: Optional[str] = None):
+        """!vote status – zeigt aktuelle Zusagen aus der DB."""
+        vote = await self.db.get_open_vote()
+        if not vote:
+            return await self.send("📭 Kein offener Vote.", room_id)
+        yes_ids = await self.db.get_vote_yes_players(vote["id"])
+        gk_ids  = await self.db.get_gk_requests(vote["id"])
+        lines = [f"📊 **Vote-Status** (ID {vote['id']}, {vote['vote_date']})", ""]
+        lines.append(f"✅ **{len(yes_ids)} Zusagen:**")
+        for mid in yes_ids:
+            p = await self.db.get_player(mid)
+            name = p["display_name"] if p else mid
+            gk = " 🥅" if mid in gk_ids else ""
+            lines.append(f"  · {name}{gk}")
+        if not yes_ids:
+            lines.append("  _Keine_")
+        await self.send("\n".join(lines), room_id)
 
     async def _player_list(self, room_id: Optional[str] = None):
         players = await self.db.get_all_players()
@@ -1223,7 +1274,13 @@ class TeamBot:
         else:
             return await self.send("⚠️ Alle 26 Vorschläge (A–Z) bereits erstellt.", room_id)
 
-        gk_requests = await self.db.get_gk_requests(vote["id"])
+        gk_requests      = await self.db.get_gk_requests(vote["id"])
+        injured_requests = await self.db.get_injured_requests(vote["id"])
+
+        # Injury-Penalty als temporäres Flag setzen (wird nicht gespeichert)
+        for p in players:
+            p["injured"] = p.get("matrix_id") in injured_requests
+
         t1f, gk1, t2f, gk2 = build_teams(players, gk_requests)
 
         self._proposals[next_letter] = (t1f, gk1, t2f, gk2)
@@ -1970,23 +2027,23 @@ def _opposite_slot(slot: str) -> str:
             "t1_gk": "t2_gk",       "t2_gk":    "t1_gk"}.get(slot, "t2_field")
 
 
-def _load_sync_token() -> Optional[str]:
+def _load_sync_token(path: str = SYNC_TOKEN_PATH) -> Optional[str]:
     """Gespeicherten Sync-Token laden."""
     try:
-        with open(SYNC_TOKEN_PATH, "r") as f:
+        with open(path, "r") as f:
             token = f.read().strip()
             return token if token else None
     except FileNotFoundError:
         return None
 
 
-def _save_sync_token(token: str):
+def _save_sync_token(token: str, path: str = SYNC_TOKEN_PATH):
     """Sync-Token auf Disk schreiben (atomar)."""
-    os.makedirs(os.path.dirname(SYNC_TOKEN_PATH), exist_ok=True)
-    tmp = SYNC_TOKEN_PATH + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(token)
-    os.replace(tmp, SYNC_TOKEN_PATH)
+    os.replace(tmp, path)
 
 
 def _md_to_html(text: str) -> str:

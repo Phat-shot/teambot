@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS gk_requests (
     requested_at TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(vote_id, matrix_id)
 );
+
+CREATE TABLE IF NOT EXISTS injured_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    vote_id      INTEGER NOT NULL REFERENCES votes(id),
+    matrix_id    TEXT    NOT NULL,
+    requested_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(vote_id, matrix_id)
+);
 """
 
 
@@ -310,6 +318,20 @@ class Database:
     async def get_gk_requests(self, vote_id: int) -> List[str]:
         async with self._db.execute(
             "SELECT matrix_id FROM gk_requests WHERE vote_id = ?", (vote_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+            return [r[0] for r in rows]
+
+    async def add_injured_request(self, vote_id: int, matrix_id: str):
+        await self._db.execute(
+            "INSERT OR IGNORE INTO injured_requests (vote_id, matrix_id) VALUES (?,?)",
+            (vote_id, matrix_id),
+        )
+        await self._db.commit()
+
+    async def get_injured_requests(self, vote_id: int) -> List[str]:
+        async with self._db.execute(
+            "SELECT matrix_id FROM injured_requests WHERE vote_id = ?", (vote_id,)
         ) as cur:
             rows = await cur.fetchall()
             return [r[0] for r in rows]
